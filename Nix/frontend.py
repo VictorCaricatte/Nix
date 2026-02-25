@@ -114,7 +114,7 @@ class Interface(QMainWindow):
         
         self.proc_tree.setHeaderLabels([t("process", lang), t("cpu", lang), t("mem", lang)])
         
-        # Add a 5th column for Progress in the Explorer
+        
         self.explorer.setHeaderLabels([t("name", lang), t("size", lang), t("type", lang), t("permissions", lang), "Progress"])
         self.explorer.setColumnWidth(4, 120)
         
@@ -453,7 +453,7 @@ class Interface(QMainWindow):
         exp_layout.addWidget(self.filter_input)
 
         self.explorer = ExplorerTree()
-        # Enable multiple selection via Ctrl or Shift
+        
         self.explorer.setSelectionMode(QTreeWidget.SelectionMode.ExtendedSelection)
         self.explorer.setColumnWidth(0, 250)
         self.explorer.itemDoubleClicked.connect(self.on_item_double_click)
@@ -1048,7 +1048,7 @@ class Interface(QMainWindow):
         if not self.ssh_mgr.is_connected or not self.ssh_mgr.sftp: return
         lang = self.config_mgr.language
         
-        # Não atualiza se existirem transferências ativas para não excluir as barras de progresso visuais
+        
         if self.active_transfers: 
             return 
             
