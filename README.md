@@ -1,5 +1,5 @@
 
-<img width="2048" height="2048" alt="Nix1" src="https://github.com/user-attachments/assets/1db665b5-dd7e-4367-a1b6-e5bbd5a70bb8" />
+<img width="1280" height="1280" alt="Nix1" src="https://github.com/user-attachments/assets/1db665b5-dd7e-4367-a1b6-e5bbd5a70bb8" />
 
 
 # Nix
