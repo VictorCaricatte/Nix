@@ -1,5 +1,5 @@
-<div align="ce<img width="500" height="500" alt="Nix" src="https://github.com/user-attachments/assets/9bbd04a8-b27c-44f0-a01b-df5e5255c36a" />
-nter">
+
+<img width="500" height="500" alt="Nix" src="https://github.com/user-attachments/assets/6307044f-8106-4e01-942d-bb56021f9373" />
 
 ![Nix](Nix.jpg)
 
