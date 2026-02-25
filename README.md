@@ -138,5 +138,5 @@ This project is licensed under the [MIT License](LICENSE).
 ---
 
 <div align="center">
-Made with ♥ by <a href="https://github.com/VictorCaricatte">VictorCaricatte</a>
+Made with ♥ by <a href="https://github.com/VictorCaricatte">VictorCaricatte</a> and <a href="https://github.com/angelobc-blip">Angelo Barbanti</a>
 </div>
