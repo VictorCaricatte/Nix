@@ -1,9 +1,8 @@
 
 <img width="500" height="500" alt="Nix" src="https://github.com/user-attachments/assets/6307044f-8106-4e01-942d-bb56021f9373" />
 
-![Nix](Nix.jpg)
 
-# Nix 🐧
+# Nix 
 
 **A user-friendly graphical interface for Ubuntu Linux servers over SSH.**
 *Made with love, for friends who prefer seeing things visually. ♥*
