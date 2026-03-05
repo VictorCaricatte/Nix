@@ -22,7 +22,7 @@ from ssh import SSHManager
 import backend
 from i18n import t
 from widgets import ExplorerTree
-from dialogs import RemoteEditorDialog, ImageViewerDialog, TextViewerDialog, ScreensManagerDialog, EnvManagerDialog
+from dialogs import RemoteEditorDialog, ImageViewerDialog, TextViewerDialog, ScreensManagerDialog, EnvManagerDialog, TableViewerDialog
 
 def resource_path(relative_path):
     try:
@@ -39,6 +39,7 @@ class Interface(QMainWindow):
     sig_screens = pyqtSignal(object, str)
     sig_viewer = pyqtSignal(str, str, str)
     sig_image_viewer = pyqtSignal(str, bytes)
+    sig_table_viewer = pyqtSignal(str, str)
     sig_msg = pyqtSignal(str, str, str)
     sig_conn_state = pyqtSignal(bool, str) 
     sig_env_list = pyqtSignal(object, str, list)
@@ -51,8 +52,12 @@ class Interface(QMainWindow):
         self.setWindowTitle("Nix")
         self.resize(1300, 850)
         
+        self.setDockOptions(QMainWindow.DockOption.AnimatedDocks | QMainWindow.DockOption.AllowNestedDocks | QMainWindow.DockOption.AllowTabbedDocks)
+        
         self.config_mgr = ConfigManager()
         self.ssh_mgr = SSHManager()
+        
+        self.terminal_font_size = self.config_mgr.theme.get("font_size", 13)
         
         self.remote_path = "/home"
         self.ctrl_a_pressed = False
@@ -68,6 +73,7 @@ class Interface(QMainWindow):
         self.sig_screens.connect(self.update_screens_ui_slot)
         self.sig_viewer.connect(self.open_file_viewer_slot)
         self.sig_image_viewer.connect(self.open_image_viewer_slot)
+        self.sig_table_viewer.connect(self.open_table_viewer_slot)
         self.sig_msg.connect(self.show_msg_slot)
         self.sig_conn_state.connect(self.update_conn_btn_slot)
         self.sig_env_list.connect(self.update_env_list_slot)
@@ -78,6 +84,38 @@ class Interface(QMainWindow):
         self.create_core_widgets()
         self.apply_layout()
         self.update_ui_texts()
+        self._setup_shortcuts()
+
+    def _setup_shortcuts(self):
+        act_f5 = QAction(self)
+        act_f5.setShortcut("F5")
+        act_f5.triggered.connect(lambda: self.sig_explorer.emit() if self.ssh_mgr.is_connected else None)
+        self.addAction(act_f5)
+
+        act_f6 = QAction(self)
+        act_f6.setShortcut("F6")
+        act_f6.triggered.connect(self.shortcut_rename)
+        self.addAction(act_f6)
+
+        act_f7 = QAction(self)
+        act_f7.setShortcut("F7")
+        act_f7.triggered.connect(self.shortcut_mkdir)
+        self.addAction(act_f7)
+
+        act_f8 = QAction(self)
+        act_f8.setShortcut("F8")
+        act_f8.triggered.connect(self.shortcut_delete)
+        self.addAction(act_f8)
+
+        act_f9 = QAction(self)
+        act_f9.setShortcut("F9")
+        act_f9.triggered.connect(self.clear_terminal)
+        self.addAction(act_f9)
+
+        act_f10 = QAction(self)
+        act_f10.setShortcut("F10")
+        act_f10.triggered.connect(self.handle_connection)
+        self.addAction(act_f10)
 
     def update_ui_texts(self):
         lang = self.config_mgr.language
@@ -102,19 +140,19 @@ class Interface(QMainWindow):
         self.btn_lang.setText(f"🌐 {t('language', lang)}")
 
         self.lbl_term.setText(f"💻 {t('terminal', lang)}")
-        if "IN SCREEN" not in self.lbl_screen_status.text() and "TELA" not in self.lbl_screen_status.text():
+        if "IN SCREEN" not in self.lbl_screen_status.text() and "TELA" not in self.lbl_screen_status.text() and "PANTALLA" not in self.lbl_screen_status.text():
             self.lbl_screen_status.setText(f"🟢 {t('state_main', lang)}")
             
         self.btn_clear.setText(t("clear_local", lang))
         self.btn_force.setText(t("force_main", lang))
+        self.btn_font_up.setText(t("font_up", lang))
+        self.btn_font_down.setText(t("font_down", lang))
         
         self.lbl_proc.setText(f"☷ {t('processes', lang)}")
         self.sys_tabs.setTabText(0, t("sys_mon", lang))
         self.sys_tabs.setTabText(1, t("os_info", lang))
         
         self.proc_tree.setHeaderLabels([t("process", lang), t("cpu", lang), t("mem", lang)])
-        
-        
         self.explorer.setHeaderLabels([t("name", lang), t("size", lang), t("type", lang), t("permissions", lang), "Progress"])
         self.explorer.setColumnWidth(4, 120)
         
@@ -177,14 +215,14 @@ class Interface(QMainWindow):
         QPushButton {{ background-color: {accent}; color: white; border-radius: 6px; padding: 6px 14px; font-weight: bold; border: none; }}
         QPushButton:hover {{ background-color: {fg}; color: {hover_fg}; }}
         QPushButton:disabled {{ background-color: {btn_disabled_bg}; color: {btn_disabled_fg}; }}
-        QTreeWidget, QListWidget {{ background-color: {bg}; color: {fg}; border: 1px solid {border}; border-radius: 8px; outline: none; padding: 5px; }}
+        QTreeWidget, QListWidget, QTableView {{ background-color: {bg}; color: {fg}; border: 1px solid {border}; border-radius: 8px; outline: none; padding: 5px; }}
         QTreeWidget::item, QListWidget::item {{ padding: 4px; border-radius: 4px; }}
-        QTreeWidget::item:selected, QListWidget::item:selected {{ background-color: {accent}; color: white; }}
+        QTreeWidget::item:selected, QListWidget::item:selected, QTableView::item:selected {{ background-color: {accent}; color: white; }}
         QHeaderView::section {{ background-color: {card}; color: {accent}; padding: 6px; font-weight: bold; border: none; border-bottom: 2px solid {accent}; }}
         QTabWidget::pane {{ border: 1px solid {border}; border-radius: 8px; background: {card}; }}
         QTabBar::tab {{ background: {bg}; color: {fg}; padding: 8px 16px; border: 1px solid {border}; border-bottom-color: {border}; border-top-left-radius: 4px; border-top-right-radius: 4px; }}
         QTabBar::tab:selected {{ background: {card}; color: {accent}; font-weight: bold; border-bottom-color: {card}; }}
-        QTextEdit, QPlainTextEdit {{ background-color: {term_bg_eff}; color: {term_color}; border: 1px solid {border}; border-radius: 8px; padding: 10px; font-family: {term_font}; font-size: 13px; font-weight: {term_weight}; }}
+        QTextEdit, QPlainTextEdit {{ background-color: {term_bg_eff}; color: {term_color}; border: 1px solid {border}; border-radius: 8px; padding: 10px; font-family: {term_font}; font-size: {self.terminal_font_size}px; font-weight: {term_weight}; }}
         QScrollBar:vertical {{ background-color: {bg}; width: 12px; margin: 0px; border-radius: 6px; }}
         QScrollBar::handle:vertical {{ background-color: {accent}; min-height: 20px; border-radius: 6px; margin: 2px; }}
         QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0px; }}
@@ -219,8 +257,10 @@ class Interface(QMainWindow):
         self.sig_log.emit(f"[{t('term_style', lang)}: {style_name}]")
 
     def toggle_language(self):
+        langs = ["en", "pt", "es"]
         current_lang = self.config_mgr.language
-        self.config_mgr.language = "pt" if current_lang == "en" else "en"
+        idx = langs.index(current_lang) if current_lang in langs else 0
+        self.config_mgr.language = langs[(idx + 1) % len(langs)]
         self.config_mgr.save_config()
         self.update_ui_texts()
 
@@ -245,6 +285,19 @@ class Interface(QMainWindow):
         color = QColorDialog.getColor(initial=QColor(current_color), parent=self)
         if color.isValid():
             self.config_mgr.theme['terminal_color'] = color.name()
+            self.config_mgr.save_config()
+            self.apply_theme()
+
+    def increase_font(self):
+        self.terminal_font_size += 1
+        self.config_mgr.theme["font_size"] = self.terminal_font_size
+        self.config_mgr.save_config()
+        self.apply_theme()
+
+    def decrease_font(self):
+        if self.terminal_font_size > 6:
+            self.terminal_font_size -= 1
+            self.config_mgr.theme["font_size"] = self.terminal_font_size
             self.config_mgr.save_config()
             self.apply_theme()
 
@@ -453,7 +506,6 @@ class Interface(QMainWindow):
         exp_layout.addWidget(self.filter_input)
 
         self.explorer = ExplorerTree()
-        
         self.explorer.setSelectionMode(QTreeWidget.SelectionMode.ExtendedSelection)
         self.explorer.setColumnWidth(0, 250)
         self.explorer.itemDoubleClicked.connect(self.on_item_double_click)
@@ -472,11 +524,20 @@ class Interface(QMainWindow):
         top_term_layout = QHBoxLayout()
         self.lbl_term = QLabel()
         self.lbl_term.setObjectName("Title")
+        
+        self.btn_font_down = QPushButton()
+        self.btn_font_down.clicked.connect(self.decrease_font)
+        
+        self.btn_font_up = QPushButton()
+        self.btn_font_up.clicked.connect(self.increase_font)
+        
         self.lbl_screen_status = QLabel()
         self.lbl_screen_status.setObjectName("Status")
         self.lbl_screen_status.setStyleSheet("color: #28a745;")
         
         top_term_layout.addWidget(self.lbl_term)
+        top_term_layout.addWidget(self.btn_font_down)
+        top_term_layout.addWidget(self.btn_font_up)
         top_term_layout.addStretch()
         top_term_layout.addWidget(self.lbl_screen_status)
         term_layout.addLayout(top_term_layout)
@@ -641,6 +702,9 @@ class Interface(QMainWindow):
         action_edit = QAction(t("edit_nano", lang), self)
         action_edit.triggered.connect(lambda: self.ctx_edit(item))
         
+        action_mkdir = QAction(t("new_folder", lang), self)
+        action_mkdir.triggered.connect(self.shortcut_mkdir)
+        
         action_copy = QAction(t("copy_path", lang), self)
         action_copy.triggered.connect(lambda: self.ctx_copy_path(item))
         
@@ -674,6 +738,7 @@ class Interface(QMainWindow):
         menu.addAction(action_open)
         menu.addAction(action_edit)
         menu.addSeparator()
+        menu.addAction(action_mkdir)
         menu.addAction(action_copy)
         menu.addAction(action_rename)
         menu.addAction(action_move)
@@ -700,6 +765,26 @@ class Interface(QMainWindow):
         paths = [self.get_item_info(item)[1] for item in items]
         QApplication.clipboard().setText("\n".join(paths))
         self.sig_log.emit(t("path_copied", self.config_mgr.language) + f": {len(paths)} items")
+
+    def shortcut_rename(self):
+        items = self.explorer.selectedItems()
+        if items: self.ctx_rename(items[0])
+
+    def shortcut_delete(self):
+        items = self.explorer.selectedItems()
+        if items: self.ctx_delete(None)
+        
+    def shortcut_mkdir(self):
+        if not self.ssh_mgr.is_connected: return
+        lang = self.config_mgr.language
+        new_dir, ok = QInputDialog.getText(self, t("new_folder", lang), t("folder_name", lang))
+        if ok and new_dir:
+            try:
+                target_path = posixpath.join(self.remote_path, new_dir)
+                with self.ssh_mgr.lock: self.ssh_mgr.sftp.mkdir(target_path)
+                self.sig_explorer.emit()
+            except Exception as e:
+                self.sig_msg.emit("error", t("error", lang), f"Erro: {str(e)}")
 
     def ctx_rename(self, item):
         lang = self.config_mgr.language
@@ -896,7 +981,7 @@ class Interface(QMainWindow):
         cmd = self.cmd_input.text().strip()
         if not cmd: return
         
-        if cmd.startswith("screen -S") or cmd.startswith("screen -r"):
+        if cmd.startswith("screen -S") or cmd.startswith("screen -r") or cmd.startswith("screen -x"):
             parts = cmd.split()
             if len(parts) > 2: self.set_screen_status(True, parts[2])
             else: self.set_screen_status(True, "Active")
@@ -914,25 +999,32 @@ class Interface(QMainWindow):
         
         if cmd == "clear": 
             self.clear_terminal()
-            if self.ssh_mgr.shell: self.ssh_mgr.shell.send("clear\n")
+            if self.ssh_mgr.shell: self.ssh_mgr.shell.send("clear\r")
             self.cmd_input.clear()
             return
 
         if cmd.startswith("cd "):
             target = cmd[3:].strip()
             try:
-                if target == "..": self.navigate_back()
-                elif target == "~" or target == "": self.go_home()
+                if target == "..": 
+                    self.navigate_back()
+                    self.cmd_input.clear()
+                    return
+                elif target == "~" or target == "": 
+                    self.go_home()
+                    self.cmd_input.clear()
+                    return
                 else:
                     new_path = target if target.startswith("/") else posixpath.join(self.remote_path, target)
                     with self.ssh_mgr.lock:
                         self.ssh_mgr.sftp.chdir(new_path)
                         self.remote_path = self.ssh_mgr.sftp.getcwd() or new_path
                     self.sig_explorer.emit()
-            except Exception: pass
+            except Exception as e:
+                self.sig_log.emit(f"cd erro: {str(e)}")
 
         if self.ssh_mgr.shell:
-            self.ssh_mgr.shell.send(cmd + "\n")
+            self.ssh_mgr.shell.send(cmd + "\r")
             
         self.cmd_input.clear()
 
@@ -958,6 +1050,8 @@ class Interface(QMainWindow):
                 real_home = stdout.read().decode().strip()
                 if real_home: self.remote_path = real_home
             except: pass
+            if self.ssh_mgr.shell:
+                self.ssh_mgr.shell.send(f'cd "{self.remote_path}"\r')
         self.sig_explorer.emit()
 
     def navigate_back(self):
@@ -968,8 +1062,11 @@ class Interface(QMainWindow):
                 with self.ssh_mgr.lock: 
                     self.ssh_mgr.sftp.chdir(parent)
                     self.remote_path = parent if parent else "/"
+                if self.ssh_mgr.shell:
+                    self.ssh_mgr.shell.send(f'cd "{self.remote_path}"\r')
                 self.sig_explorer.emit()
-            except Exception: pass
+            except Exception as e: 
+                self.sig_msg.emit("error", t("error", self.config_mgr.language), f"Erro ao subir diretório: {str(e)}")
 
     def on_item_double_click(self, item, column):
         if not self.ssh_mgr.is_connected or not self.ssh_mgr.sftp: return
@@ -983,10 +1080,13 @@ class Interface(QMainWindow):
                 with self.ssh_mgr.lock: 
                     self.ssh_mgr.sftp.chdir(new_path)
                     self.remote_path = new_path
+                if self.ssh_mgr.shell:
+                    self.ssh_mgr.shell.send(f'cd "{self.remote_path}"\r')
                 self.sig_explorer.emit()
             else:
                 threading.Thread(target=self.preview_file, args=(new_path, filename), daemon=True).start()
-        except: pass
+        except Exception as e: 
+            self.sig_msg.emit("error", t("error", self.config_mgr.language), f"Não foi possível abrir o item: {str(e)}")
 
     def preview_file(self, file_path, filename):
         try:
@@ -1003,7 +1103,18 @@ class Interface(QMainWindow):
                 self.sig_image_viewer.emit(filename, img_data)
                 return
 
-            lazy_exts = ('.fasta', '.fna', '.vcf', '.tsv', '.csv', '.sam', '.fastq')
+            valid_table_exts = ('.csv', '.tsv')
+            if filename.lower().endswith(valid_table_exts):
+                if size > 15 * 1024 * 1024:
+                    self.sig_msg.emit("warn", t("warning", self.config_mgr.language), t("file_large", self.config_mgr.language))
+                    return
+                with self.ssh_mgr.lock:
+                    with self.ssh_mgr.sftp.open(file_path, 'r') as f:
+                        content = f.read().decode('utf-8', errors='replace')
+                self.sig_table_viewer.emit(filename, content)
+                return
+
+            lazy_exts = ('.fasta', '.fna', '.vcf', '.sam', '.fastq', '.txt', '.py', '.json', '.sh')
             is_lazy = filename.lower().endswith(lazy_exts) or size > 1024 * 1024
             
             read_size = 100 * 1024 if is_lazy else size 
@@ -1022,6 +1133,10 @@ class Interface(QMainWindow):
 
     def open_image_viewer_slot(self, filename, img_data):
         viewer = ImageViewerDialog(self, filename, img_data)
+        viewer.show()
+
+    def open_table_viewer_slot(self, filename, content):
+        viewer = TableViewerDialog(self, filename, content)
         viewer.show()
 
     def open_file_viewer_slot(self, file_path, filename, content):
@@ -1220,8 +1335,9 @@ class Interface(QMainWindow):
             self.sig_conn_state.emit(True, t("disconnect", lang))
             time.sleep(1) 
             self.sig_explorer.emit()
-        except Exception:
+        except Exception as e:
             self.sig_conn_state.emit(True, t("connect", lang))
+            self.sig_msg.emit("error", t("error", lang), str(e))
 
     def fetch_os_thread(self):
         info = backend.fetch_os_info(self.ssh_mgr)
