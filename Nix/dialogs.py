@@ -1,12 +1,15 @@
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QPlainTextEdit, QMessageBox, QPushButton, QLabel, 
-    QHBoxLayout, QFrame, QTextEdit, QListWidget, QFileDialog, QLineEdit
+    QHBoxLayout, QFrame, QTextEdit, QListWidget, QFileDialog, QLineEdit,
+    QTableView, QHeaderView
 )
-from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QPixmap
+from PyQt6.QtCore import Qt, QTimer, QSortFilterProxyModel
+from PyQt6.QtGui import QPixmap, QStandardItemModel, QStandardItem
 import posixpath
 import threading
 import os
+import csv
+import io
 
 try:
     from pygments import highlight
@@ -26,6 +29,12 @@ class RemoteEditorDialog(QDialog):
         self.use_sudo = use_sudo
         self.sudo_pwd = sudo_pwd
         self.lang = parent.config_mgr.language
+        
+        # Garante que o caminho seja absoluto, evitando erros no execute do SSH
+        if self.filename.startswith('/'):
+            self.full_path = self.filename
+        else:
+            self.full_path = posixpath.join(self.parent_ui.remote_path, self.filename)
         
         self.setWindowTitle(f"Nano: {filename}")
         self.resize(900, 600)
@@ -61,16 +70,36 @@ class RemoteEditorDialog(QDialog):
         content = ""
         try:
             if self.use_sudo:
-                stdin, stdout, stderr = self.parent_ui.ssh_mgr.execute(f"sudo -S cat {self.filename}")
+                safe_path = self.full_path.replace('"', '\\"')
+                stdin, stdout, stderr = self.parent_ui.ssh_mgr.execute(f'sudo -S cat "{safe_path}"')
+                stdout.channel.settimeout(5.0)
+                stderr.channel.settimeout(5.0)
+                
                 stdin.write(self.sudo_pwd + "\n")
                 stdin.flush()
-                content = stdout.read().decode('utf-8', errors='replace')
-                if "incorrect password" in stderr.read().decode('utf-8').lower():
-                    QMessageBox.critical(self, t("error", self.lang), t("incorrect_pass", self.lang))
+                stdin.close()
+                
+                err_out = ""
+                try:
+                    err_out = stderr.read().decode('utf-8', errors='replace').lower()
+                except Exception:
+                    pass
+                    
+                content_bytes = b""
+                try:
+                    content_bytes = stdout.read()
+                except Exception:
+                    pass
+                    
+                content = content_bytes.decode('utf-8', errors='replace')
+                
+                if "incorrect password" in err_out or "senha incorreta" in err_out or "try again" in err_out or "tente novamente" in err_out:
+                    QMessageBox.critical(self, t("error", self.lang), f"{t('incorrect_pass', self.lang)}\n{err_out.strip()}")
+                    QTimer.singleShot(0, self.reject)
                     return
             else:
                 sftp = self.parent_ui.ssh_mgr.client.open_sftp()
-                with sftp.open(posixpath.join(self.parent_ui.remote_path, self.filename), 'r') as f:
+                with sftp.open(self.full_path, 'r') as f:
                     content = f.read().decode('utf-8')
                 sftp.close()
         except Exception:
@@ -86,19 +115,83 @@ class RemoteEditorDialog(QDialog):
                 with sftp.open(tmp_file, 'w') as f:
                     f.write(new_content)
                 sftp.close()
-                cmd = f"sudo -S mv {tmp_file} {self.filename} && sudo -S chown root:root {self.filename}"
+                
+                safe_path = self.full_path.replace('"', '\\"')
+                cmd = f'sudo -S mv {tmp_file} "{safe_path}" && sudo -S chown root:root "{safe_path}"'
+                
                 stdin, stdout, stderr = self.parent_ui.ssh_mgr.execute(cmd)
                 stdin.write(self.sudo_pwd + "\n")
                 stdin.flush()
+                stdin.close()
+                
+                err_output = stderr.read().decode('utf-8', errors='replace').lower()
+                if "incorrect password" in err_output or "senha incorreta" in err_output or "try again" in err_output or "tente novamente" in err_output:
+                    QMessageBox.critical(self, t("error", self.lang), t("incorrect_pass", self.lang))
+                    return
                 QMessageBox.information(self, t("success", self.lang), t("saved_root", self.lang))
             else:
                 sftp = self.parent_ui.ssh_mgr.client.open_sftp()
-                with sftp.open(posixpath.join(self.parent_ui.remote_path, self.filename), 'w') as f:
+                with sftp.open(self.full_path, 'w') as f:
                     f.write(new_content)
                 sftp.close()
                 QMessageBox.information(self, t("success", self.lang), t("saved", self.lang))
         except Exception as e:
             QMessageBox.critical(self, t("error", self.lang), str(e))
+
+class TableViewerDialog(QDialog):
+    def __init__(self, parent, filename, content):
+        super().__init__(parent)
+        self.lang = parent.config_mgr.language
+        self.setWindowTitle(f"{t('table_viewer', self.lang)}: {filename}")
+        self.resize(1000, 700)
+        
+        layout = QVBoxLayout(self)
+        
+        search_layout = QHBoxLayout()
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText(t("search_table", self.lang))
+        self.search_input.textChanged.connect(self.filter_table)
+        search_layout.addWidget(self.search_input)
+        layout.addLayout(search_layout)
+        
+        self.table_view = QTableView()
+        self.model = QStandardItemModel()
+        self.proxy_model = QSortFilterProxyModel()
+        self.proxy_model.setSourceModel(self.model)
+        self.proxy_model.setFilterCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        self.proxy_model.setFilterKeyColumn(-1)
+        
+        self.table_view.setModel(self.proxy_model)
+        self.table_view.setSortingEnabled(True)
+        layout.addWidget(self.table_view)
+        
+        self.populate_data(filename, content)
+        
+    def populate_data(self, filename, content):
+        delimiter = '\t' if filename.lower().endswith('.tsv') else ','
+        if filename.lower().endswith('.csv') and ';' in content[:1024] and ',' not in content[:1024]:
+            delimiter = ';'
+            
+        f = io.StringIO(content)
+        reader = csv.reader(f, delimiter=delimiter)
+        
+        try:
+            headers = next(reader)
+            self.model.setHorizontalHeaderLabels(headers)
+            
+            for row_data in reader:
+                row_items = [QStandardItem(str(cell)) for cell in row_data]
+                self.model.appendRow(row_items)
+        except StopIteration:
+            pass
+        except Exception:
+            pass
+        
+        self.table_view.horizontalHeader().setStretchLastSection(True)
+        self.table_view.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+
+    def filter_table(self, text):
+        self.proxy_model.setFilterFixedString(text)
 
 class ImageViewerDialog(QDialog):
     def __init__(self, parent, filename, img_data):
@@ -263,7 +356,7 @@ class ScreensManagerDialog(QDialog):
             self.screens_container.addWidget(QLabel(t("no_screens", self.lang)))
 
     def attach_screen(self, name):
-        self.parent_ui.cmd_input.setText(f"screen -r {name}")
+        self.parent_ui.cmd_input.setText(f"screen -x {name}")
         self.parent_ui.send_command()
         self.close()
 
