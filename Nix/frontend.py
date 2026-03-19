@@ -129,17 +129,17 @@ class Interface(QMainWindow):
         else:
             self.btn_conn.setText(t("disconnect", lang))
             
-        self.btn_screens.setText(f"📺 {t('screens', lang)}")
+        self.btn_screens.setText(f" {t('screens', lang)}")
         self.btn_env.setText(f"≡ {t('env_list', lang)}")
-        self.btn_term_style.setText(f"🖥️ {t('term_style', lang)}")
-        self.btn_mode.setText(f"🌓 {t('mode', lang)}")
-        self.btn_color.setText(f"🎨 {t('theme', lang)}")
-        self.btn_bg_color.setText(f"🖌️ {t('bg_color', lang)}")
-        self.btn_term_color.setText(f"💻 {t('term_color', lang)}")
-        self.btn_layout.setText(f"🔲 {t('layout', lang)}")
-        self.btn_lang.setText(f"🌐 {t('language', lang)}")
+        self.btn_term_style.setText(f" {t('term_style', lang)}")
+        self.btn_mode.setText(f" {t('mode', lang)}")
+        self.btn_color.setText(f" {t('theme', lang)}")
+        self.btn_bg_color.setText(f" {t('bg_color', lang)}")
+        self.btn_term_color.setText(f" {t('term_color', lang)}")
+        self.btn_layout.setText(f" {t('layout', lang)}")
+        self.btn_lang.setText(f" {t('language', lang)}")
 
-        self.lbl_term.setText(f"💻 {t('terminal', lang)}")
+        self.lbl_term.setText(f" {t('terminal', lang)}")
         if "IN SCREEN" not in self.lbl_screen_status.text() and "TELA" not in self.lbl_screen_status.text() and "PANTALLA" not in self.lbl_screen_status.text():
             self.lbl_screen_status.setText(f"🟢 {t('state_main', lang)}")
             
