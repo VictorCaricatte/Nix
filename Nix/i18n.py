@@ -105,7 +105,9 @@ TRANSLATIONS = {
         "font_up": "A+",
         "font_down": "A-",
         "table_viewer": "Table Viewer",
-        "search_table": "Search data..."
+        "search_table": "Search data...",
+        "new_window": "New Window",
+        "x11_compress": "X11/Compress (-X -C -Y)"
     },
     "pt": {
         "new_session": "Nova Sessão",
@@ -213,7 +215,9 @@ TRANSLATIONS = {
         "font_up": "A+",
         "font_down": "A-",
         "table_viewer": "Visualizador de Tabelas",
-        "search_table": "Buscar dados..."
+        "search_table": "Buscar dados...",
+        "new_window": "Nova Janela",
+        "x11_compress": "X11/Compressão (-X -C -Y)"
     },
     "es": {
         "new_session": "Nueva Sesión",
@@ -321,7 +325,9 @@ TRANSLATIONS = {
         "font_up": "A+",
         "font_down": "A-",
         "table_viewer": "Visor de Tabla",
-        "search_table": "Buscar datos..."
+        "search_table": "Buscar datos...",
+        "new_window": "Nueva Ventana",
+        "x11_compress": "X11/Comprimir (-X -C -Y)"
     }
 }
 
