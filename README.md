@@ -89,7 +89,7 @@ Just download, run, and connect to your server.
 
 **Requirements:**
 - Python 3.10+
-- `pip install PyQt6 paramiko`
+- `pip install PyQt6 paramiko qtawesome`
 
 **Run:**
 ```bash
