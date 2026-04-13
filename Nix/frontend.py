@@ -6,16 +6,18 @@ import re
 import time
 import tempfile
 import threading
+import subprocess
+import qtawesome as qta
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
     QSplitter, QFrame, QLabel, QLineEdit, QPushButton, QTreeWidget, 
-    QTreeWidgetItem, QPlainTextEdit, QProgressBar, 
+    QTreeWidgetItem, QPlainTextEdit, QProgressBar, QSizePolicy,
     QFileDialog, QInputDialog, QMessageBox, QMenu, QColorDialog,
-    QComboBox, QDockWidget, QTabWidget, QTextEdit
+    QDockWidget, QTabWidget, QTextEdit, QCheckBox
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QEvent, QMimeData, QUrl
-from PyQt6.QtGui import QColor, QAction, QDrag, QPixmap, QIcon
+from PyQt6.QtGui import QColor, QAction, QDrag, QPixmap
 
 from config import ConfigManager
 from ssh import SSHManager
@@ -119,18 +121,19 @@ class Interface(QMainWindow):
 
     def update_ui_texts(self):
         lang = self.config_mgr.language
-        self.cb_sessions.setItemText(0, t("new_session", lang))
         self.entry_host.setPlaceholderText(t("host_placeholder", lang))
         self.entry_pass.setPlaceholderText(t("pass_placeholder", lang))
         self.entry_key.setPlaceholderText(t("key_placeholder", lang))
+        self.chk_x11.setText(t("x11_compress", lang))
         
         if not self.ssh_mgr.is_connected:
             self.btn_conn.setText(t("connect", lang))
         else:
             self.btn_conn.setText(t("disconnect", lang))
             
+        self.btn_new_win.setText(t("new_window", lang))
         self.btn_screens.setText(f" {t('screens', lang)}")
-        self.btn_env.setText(f"≡ {t('env_list', lang)}")
+        self.btn_env.setText(f" {t('env_list', lang)}")
         self.btn_term_style.setText(f" {t('term_style', lang)}")
         self.btn_mode.setText(f" {t('mode', lang)}")
         self.btn_color.setText(f" {t('theme', lang)}")
@@ -141,14 +144,14 @@ class Interface(QMainWindow):
 
         self.lbl_term.setText(f" {t('terminal', lang)}")
         if "IN SCREEN" not in self.lbl_screen_status.text() and "TELA" not in self.lbl_screen_status.text() and "PANTALLA" not in self.lbl_screen_status.text():
-            self.lbl_screen_status.setText(f"🟢 {t('state_main', lang)}")
+            self.lbl_screen_status.setText(f" {t('state_main', lang)}")
             
         self.btn_clear.setText(t("clear_local", lang))
         self.btn_force.setText(t("force_main", lang))
         self.btn_font_up.setText(t("font_up", lang))
         self.btn_font_down.setText(t("font_down", lang))
         
-        self.lbl_proc.setText(f"☷ {t('processes', lang)}")
+        self.lbl_proc.setText(f" {t('processes', lang)}")
         self.sys_tabs.setTabText(0, t("sys_mon", lang))
         self.sys_tabs.setTabText(1, t("os_info", lang))
         
@@ -373,6 +376,8 @@ class Interface(QMainWindow):
             
             h_splitter = QSplitter(Qt.Orientation.Horizontal)
             v_splitter = QSplitter(Qt.Orientation.Vertical)
+            v_splitter.setOpaqueResize(True)
+            v_splitter.setChildrenCollapsible(False)
             
             v_splitter.addWidget(self.exp_inner)
             v_splitter.addWidget(self.term_inner)
@@ -398,62 +403,75 @@ class Interface(QMainWindow):
         if not pixmap.isNull():
             self.logo_label.setPixmap(pixmap.scaled(32, 32, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
         
-        self.cb_sessions = QComboBox()
-        self.cb_sessions.addItem("New Session")
-        self.cb_sessions.addItems(self.config_mgr.sessions.keys())
-        self.cb_sessions.currentIndexChanged.connect(self.load_session)
-        
         self.entry_host = QLineEdit()
         self.entry_pass = QLineEdit()
         self.entry_pass.setEchoMode(QLineEdit.EchoMode.Password)
         self.entry_key = QLineEdit()
         
-        btn_browse_key = QPushButton("📂")
+        btn_browse_key = QPushButton()
+        btn_browse_key.setIcon(qta.icon('fa5s.folder-open', color='white'))
         btn_browse_key.setFixedWidth(40)
         btn_browse_key.clicked.connect(self.browse_ssh_key)
         
-        btn_save = QPushButton("💾")
+        btn_save = QPushButton()
+        btn_save.setIcon(qta.icon('fa5s.save', color='white'))
         btn_save.setFixedWidth(40)
         btn_save.clicked.connect(self.save_current_session)
         
         self.btn_conn = QPushButton()
+        self.btn_conn.setIcon(qta.icon('fa5s.plug', color='white'))
         self.btn_conn.clicked.connect(self.handle_connection)
         
+        self.chk_x11 = QCheckBox()
+        self.btn_new_win = QPushButton()
+        self.btn_new_win.setIcon(qta.icon('fa5s.plus-square', color='white'))
+        self.btn_new_win.clicked.connect(self.open_new_window)
+        
         self.btn_screens = QPushButton()
+        self.btn_screens.setIcon(qta.icon('fa5s.desktop', color='white'))
         self.btn_screens.clicked.connect(self.show_screens_manager)
         
         self.btn_env = QPushButton()
+        self.btn_env.setIcon(qta.icon('fa5s.cubes', color='white'))
         self.btn_env.clicked.connect(self.show_env_list)
 
         self.btn_term_style = QPushButton()
+        self.btn_term_style.setIcon(qta.icon('fa5s.terminal', color='white'))
         self.btn_term_style.clicked.connect(self.cycle_term_style)
 
         self.btn_mode = QPushButton()
+        self.btn_mode.setIcon(qta.icon('fa5s.adjust', color='white'))
         self.btn_mode.clicked.connect(self.toggle_theme_mode)
 
         self.btn_color = QPushButton()
+        self.btn_color.setIcon(qta.icon('fa5s.palette', color='white'))
         self.btn_color.clicked.connect(self.change_theme_color)
         
         self.btn_bg_color = QPushButton()
+        self.btn_bg_color.setIcon(qta.icon('fa5s.fill-drip', color='white'))
         self.btn_bg_color.clicked.connect(self.change_bg_color)
         
         self.btn_term_color = QPushButton()
+        self.btn_term_color.setIcon(qta.icon('fa5s.font', color='white'))
         self.btn_term_color.clicked.connect(self.change_terminal_color)
 
         self.btn_layout = QPushButton()
+        self.btn_layout.setIcon(qta.icon('fa5s.columns', color='white'))
         self.btn_layout.clicked.connect(self.toggle_layout)
 
         self.btn_lang = QPushButton()
+        self.btn_lang.setIcon(qta.icon('fa5s.language', color='white'))
         self.btn_lang.clicked.connect(self.toggle_language)
 
         conn_layout.addWidget(self.logo_label)
-        conn_layout.addWidget(self.cb_sessions)
         conn_layout.addWidget(self.entry_host)
         conn_layout.addWidget(self.entry_pass)
         conn_layout.addWidget(self.entry_key)
         conn_layout.addWidget(btn_browse_key)
         conn_layout.addWidget(btn_save)
+        conn_layout.addWidget(self.chk_x11)
         conn_layout.addWidget(self.btn_conn)
+        conn_layout.addWidget(self.btn_new_win)
         conn_layout.addWidget(self.btn_screens)
         conn_layout.addWidget(self.btn_env)
         conn_layout.addWidget(self.btn_term_style)
@@ -465,36 +483,51 @@ class Interface(QMainWindow):
         conn_layout.addWidget(self.btn_lang)
 
         self.exp_inner = self.create_card()
+        self.exp_inner.setMinimumHeight(150)
+        self.exp_inner.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        
         exp_layout = QVBoxLayout(self.exp_inner)
         exp_layout.setContentsMargins(5, 5, 5, 5)
         
         path_layout = QHBoxLayout()
-        btn_home = QPushButton("🏠")
+        btn_home = QPushButton()
+        btn_home.setIcon(qta.icon('fa5s.home', color='white'))
         btn_home.setFixedWidth(40)
         btn_home.clicked.connect(self.go_home)
         
-        btn_back = QPushButton("←")
+        btn_back = QPushButton()
+        btn_back.setIcon(qta.icon('fa5s.arrow-left', color='white'))
         btn_back.setFixedWidth(40)
         btn_back.clicked.connect(self.navigate_back)
         
         self.current_path = QLabel("/home")
         
-        btn_refresh = QPushButton("↻")
+        self.btn_copy_path = QPushButton()
+        self.btn_copy_path.setIcon(qta.icon('fa5s.copy', color='white'))
+        self.btn_copy_path.setFixedWidth(40)
+        self.btn_copy_path.clicked.connect(self.copy_current_path)
+        
+        btn_refresh = QPushButton()
+        btn_refresh.setIcon(qta.icon('fa5s.sync-alt', color='white'))
         btn_refresh.setFixedWidth(40)
         btn_refresh.clicked.connect(lambda: self.sig_explorer.emit())
         
         self.btn_up_dir = QPushButton()
+        self.btn_up_dir.setIcon(qta.icon('fa5s.folder-plus', color='white'))
         self.btn_up_dir.clicked.connect(self.upload_dir_dialog)
         
         self.btn_up_file = QPushButton()
+        self.btn_up_file.setIcon(qta.icon('fa5s.file-upload', color='white'))
         self.btn_up_file.clicked.connect(self.upload_file_dialog)
         
         self.btn_down = QPushButton()
+        self.btn_down.setIcon(qta.icon('fa5s.file-download', color='white'))
         self.btn_down.clicked.connect(self.download_file_dialog)
 
         path_layout.addWidget(btn_home)
         path_layout.addWidget(btn_back)
         path_layout.addWidget(self.current_path, 1)
+        path_layout.addWidget(self.btn_copy_path)
         path_layout.addWidget(btn_refresh)
         path_layout.addWidget(self.btn_up_dir)
         path_layout.addWidget(self.btn_up_file)
@@ -511,13 +544,14 @@ class Interface(QMainWindow):
         self.explorer.itemDoubleClicked.connect(self.on_item_double_click)
         self.explorer.files_dropped.connect(self.on_drop_files)
         self.explorer.file_dragged_out.connect(self.handle_drag_out)
-        
         self.explorer.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.explorer.customContextMenuRequested.connect(self.show_context_menu)
-
         exp_layout.addWidget(self.explorer)
 
         self.term_inner = self.create_card()
+        self.term_inner.setMinimumHeight(150)
+        self.term_inner.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        
         term_layout = QVBoxLayout(self.term_inner)
         term_layout.setContentsMargins(5, 5, 5, 5)
         
@@ -526,9 +560,11 @@ class Interface(QMainWindow):
         self.lbl_term.setObjectName("Title")
         
         self.btn_font_down = QPushButton()
+        self.btn_font_down.setIcon(qta.icon('fa5s.search-minus', color='white'))
         self.btn_font_down.clicked.connect(self.decrease_font)
         
         self.btn_font_up = QPushButton()
+        self.btn_font_up.setIcon(qta.icon('fa5s.search-plus', color='white'))
         self.btn_font_up.clicked.connect(self.increase_font)
         
         self.lbl_screen_status = QLabel()
@@ -555,9 +591,11 @@ class Interface(QMainWindow):
         self.cmd_input.installEventFilter(self)
         
         self.btn_clear = QPushButton()
+        self.btn_clear.setIcon(qta.icon('fa5s.eraser', color='white'))
         self.btn_clear.clicked.connect(self.clear_terminal)
         
         self.btn_force = QPushButton()
+        self.btn_force.setIcon(qta.icon('fa5s.unlink', color='white'))
         self.btn_force.clicked.connect(lambda: self.set_screen_status(False))
 
         input_layout.addWidget(lbl_prompt)
@@ -629,22 +667,29 @@ class Interface(QMainWindow):
         
         sys_layout.addWidget(self.sys_tabs)
 
+    def open_new_window(self):
+        if getattr(sys, 'frozen', False):
+            subprocess.Popen([sys.executable])
+        else:
+            subprocess.Popen([sys.executable] + sys.argv)
+
+    def update_path_label(self):
+        path = self.remote_path
+        if len(path) > 40:
+            path = "..." + path[-37:]
+        self.current_path.setText(path)
+        self.current_path.setToolTip(self.remote_path)
+
+    def copy_current_path(self):
+        QApplication.clipboard().setText(self.remote_path)
+        lang = self.config_mgr.language
+        self.sig_log.emit(f"[{t('path_copied', lang)}: {self.remote_path}]")
+
     def browse_ssh_key(self):
         lang = self.config_mgr.language
         file, _ = QFileDialog.getOpenFileName(self, t("sel_key", lang), os.path.expanduser("~/.ssh"))
         if file:
             self.entry_key.setText(file)
-
-    def load_session(self):
-        session_name = self.cb_sessions.currentText()
-        if session_name in self.config_mgr.sessions:
-            data = self.config_mgr.sessions[session_name]
-            self.entry_host.setText(data.get("host", ""))
-            self.entry_key.setText(data.get("key", ""))
-        else:
-            self.entry_host.clear()
-            self.entry_key.clear()
-            self.entry_pass.clear()
 
     def eventFilter(self, obj, event):
         if obj == self.cmd_input and event.type() == QEvent.Type.KeyPress:
@@ -696,25 +741,25 @@ class Interface(QMainWindow):
         lang = self.config_mgr.language
         menu = QMenu(self)
         
-        action_open = QAction(t("open", lang), self)
+        action_open = QAction(qta.icon('fa5s.folder-open', color='white'), t("open", lang), self)
         action_open.triggered.connect(lambda: self.on_item_double_click(item, 0))
         
-        action_edit = QAction(t("edit_nano", lang), self)
+        action_edit = QAction(qta.icon('fa5s.edit', color='white'), t("edit_nano", lang), self)
         action_edit.triggered.connect(lambda: self.ctx_edit(item))
         
-        action_mkdir = QAction(t("new_folder", lang), self)
+        action_mkdir = QAction(qta.icon('fa5s.folder-plus', color='white'), t("new_folder", lang), self)
         action_mkdir.triggered.connect(self.shortcut_mkdir)
         
-        action_copy = QAction(t("copy_path", lang), self)
+        action_copy = QAction(qta.icon('fa5s.copy', color='white'), t("copy_path", lang), self)
         action_copy.triggered.connect(lambda: self.ctx_copy_path(item))
         
-        action_rename = QAction(t("rename", lang), self)
+        action_rename = QAction(qta.icon('fa5s.i-cursor', color='white'), t("rename", lang), self)
         action_rename.triggered.connect(lambda: self.ctx_rename(item))
         
-        action_move = QAction(t("move", lang), self)
+        action_move = QAction(qta.icon('fa5s.people-carry', color='white'), t("move", lang), self)
         action_move.triggered.connect(lambda: self.ctx_move(item))
         
-        action_delete = QAction(t("delete", lang), self)
+        action_delete = QAction(qta.icon('fa5s.trash-alt', color='white'), t("delete", lang), self)
         action_delete.triggered.connect(lambda: self.ctx_delete(item))
         
         menu.addSeparator()
@@ -722,17 +767,17 @@ class Interface(QMainWindow):
         filename, new_path, item_type = self.get_item_info(item)
         
         if item_type == "Directory" or item_type == t("directory", lang):
-            action_compress = QAction(t("compress", lang), self)
+            action_compress = QAction(qta.icon('fa5s.file-archive', color='white'), t("compress", lang), self)
             action_compress.triggered.connect(lambda: self.ctx_compress(new_path, filename))
             menu.addAction(action_compress)
             
         elif filename.endswith(('.tar.gz', '.tgz', '.zip', '.tar')):
-            action_extract = QAction(t("extract", lang), self)
+            action_extract = QAction(qta.icon('fa5s.box-open', color='white'), t("extract", lang), self)
             action_extract.triggered.connect(lambda: self.ctx_extract(new_path, filename))
             menu.addAction(action_extract)
 
         menu.addSeparator()
-        action_props = QAction(t("properties", lang), self)
+        action_props = QAction(qta.icon('fa5s.info-circle', color='white'), t("properties", lang), self)
         action_props.triggered.connect(lambda: self.ctx_properties(item))
         
         menu.addAction(action_open)
@@ -749,7 +794,7 @@ class Interface(QMainWindow):
         menu.exec(self.explorer.viewport().mapToGlobal(pos))
 
     def get_item_info(self, item):
-        filename = item.text(0).split(" ", 1)[-1].strip()
+        filename = item.text(0).strip()
         item_type = item.text(2)
         new_path = f"/{filename}" if self.remote_path == "/" else posixpath.join(self.remote_path, filename)
         return filename, new_path, item_type
@@ -1068,11 +1113,128 @@ class Interface(QMainWindow):
             except Exception as e: 
                 self.sig_msg.emit("error", t("error", self.config_mgr.language), f"Erro ao subir diretório: {str(e)}")
 
+    def get_file_icon(self, filename, is_dir=False):
+        try:
+            if is_dir:
+                return qta.icon('fa5s.folder', color='#eccb5b')
+
+            ext = os.path.splitext(filename)[1].lower()
+            
+            icons = {
+                '.py': ('fa5b.python', '#3776AB'),
+                '.pyc': ('fa5b.python', '#3776AB'),
+                '.js': ('fa5b.js', '#F7DF1E'),
+                '.ts': ('fa5b.js-square', '#3178C6'),
+                '.html': ('fa5b.html5', '#E34F26'),
+                '.css': ('fa5b.css3-alt', '#1572B6'),
+                '.c': ('fa5s.file-code', '#A8B9CC'),
+                '.cpp': ('fa5s.file-code', '#00599C'),
+                '.h': ('fa5s.file-code', '#A8B9CC'),
+                '.hpp': ('fa5s.file-code', '#A8B9CC'),
+                '.java': ('fa5b.java', '#007396'),
+                '.go': ('fa5s.file-code', '#00ADD8'),
+                '.rs': ('fa5s.cog', '#000000'),
+                '.rb': ('fa5s.gem', '#CC342D'),
+                '.php': ('fa5b.php', '#777BB4'),
+                '.sh': ('fa5s.terminal', '#4EAA25'),
+                '.bash': ('fa5s.terminal', '#4EAA25'),
+                '.zsh': ('fa5s.terminal', '#4EAA25'),
+                '.swift': ('fa5b.swift', '#F05138'),
+                '.kt': ('fa5s.file-code', '#7F52FF'),
+                '.r': ('fa5b.r-project', '#276DC3'),
+                '.pl': ('fa5s.file-code', '#000000'),
+                '.json': ('fa5s.file-code', '#CBCB41'),
+                '.xml': ('fa5s.file-code', '#00608C'),
+                '.yaml': ('fa5s.cogs', '#CB171E'),
+                '.yml': ('fa5s.cogs', '#CB171E'),
+                '.ini': ('fa5s.cogs', '#A9A9A9'),
+                '.conf': ('fa5s.cogs', '#A9A9A9'),
+                '.cfg': ('fa5s.cogs', '#A9A9A9'),
+                '.toml': ('fa5s.cogs', '#A9A9A9'),
+                '.env': ('fa5s.lock', '#A9A9A9'),
+                '.csv': ('fa5s.file-csv', '#217346'),
+                '.tsv': ('fa5s.file-csv', '#217346'),
+                '.sql': ('fa5s.database', '#F29111'),
+                '.db': ('fa5s.database', '#A9A9A9'),
+                '.sqlite': ('fa5s.database', '#A9A9A9'),
+                '.txt': ('fa5s.file-alt', '#A9A9A9'),
+                '.md': ('fa5b.markdown', '#000000'),
+                '.rtf': ('fa5s.file-alt', '#A9A9A9'),
+                '.pdf': ('fa5s.file-pdf', '#F40F02'),
+                '.doc': ('fa5s.file-word', '#2B579A'),
+                '.docx': ('fa5s.file-word', '#2B579A'),
+                '.odt': ('fa5s.file-word', '#2B579A'),
+                '.xls': ('fa5s.file-excel', '#217346'),
+                '.xlsx': ('fa5s.file-excel', '#217346'),
+                '.ods': ('fa5s.file-excel', '#217346'),
+                '.ppt': ('fa5s.file-powerpoint', '#D24726'),
+                '.pptx': ('fa5s.file-powerpoint', '#D24726'),
+                '.odp': ('fa5s.file-powerpoint', '#D24726'),
+                '.png': ('fa5s.file-image', '#12B886'),
+                '.jpg': ('fa5s.file-image', '#12B886'),
+                '.jpeg': ('fa5s.file-image', '#12B886'),
+                '.svg': ('fa5s.file-image', '#FFB13B'),
+                '.gif': ('fa5s.file-image', '#12B886'),
+                '.bmp': ('fa5s.file-image', '#12B886'),
+                '.webp': ('fa5s.file-image', '#12B886'),
+                '.ico': ('fa5s.file-image', '#12B886'),
+                '.tiff': ('fa5s.file-image', '#12B886'),
+                '.mp3': ('fa5s.file-audio', '#000000'),
+                '.wav': ('fa5s.file-audio', '#000000'),
+                '.ogg': ('fa5s.file-audio', '#000000'),
+                '.flac': ('fa5s.file-audio', '#000000'),
+                '.m4a': ('fa5s.file-audio', '#000000'),
+                '.mp4': ('fa5s.file-video', '#000000'),
+                '.avi': ('fa5s.file-video', '#000000'),
+                '.mkv': ('fa5s.file-video', '#000000'),
+                '.mov': ('fa5s.file-video', '#000000'),
+                '.webm': ('fa5s.file-video', '#000000'),
+                '.flv': ('fa5s.file-video', '#000000'),
+                '.tar': ('fa5s.file-archive', '#EFC050'),
+                '.gz': ('fa5s.file-archive', '#EFC050'),
+                '.tgz': ('fa5s.file-archive', '#EFC050'),
+                '.zip': ('fa5s.file-archive', '#EFC050'),
+                '.rar': ('fa5s.file-archive', '#EFC050'),
+                '.7z': ('fa5s.file-archive', '#EFC050'),
+                '.bz2': ('fa5s.file-archive', '#EFC050'),
+                '.xz': ('fa5s.file-archive', '#EFC050'),
+                '.deb': ('fa5s.box', '#EFC050'),
+                '.rpm': ('fa5s.box', '#EFC050'),
+                '.apk': ('fa5b.android', '#a4c639'),
+                '.fastq': ('fa5s.dna', '#20B2AA'),
+                '.fasta': ('fa5s.dna', '#20B2AA'),
+                '.fna': ('fa5s.dna', '#20B2AA'),
+                '.gbk': ('fa5s.dna', '#20B2AA'),
+                '.gbff': ('fa5s.dna', '#20B2AA'),
+                '.bam': ('fa5s.dna', '#20B2AA'),
+                '.sam': ('fa5s.dna', '#20B2AA'),
+                '.vcf': ('fa5s.dna', '#20B2AA'),
+                '.exe': ('fa5b.windows', '#000000'),
+                '.dll': ('fa5s.cogs', '#000000'),
+                '.so': ('fa5s.cogs', '#000000'),
+                '.bin': ('fa5s.file-medical-alt', '#000000'),
+                '.iso': ('fa5s.compact-disc', '#000000'),
+                '.sys': ('fa5s.cogs', '#000000'),
+                '.bat': ('fa5s.terminal', '#000000'),
+                '.ps1': ('fa5s.terminal', '#000000'),
+                '.log': ('fa5s.clipboard-list', '#A9A9A9'),
+                '.bak': ('fa5s.history', '#A9A9A9')
+            }
+            
+            icon_name, color = icons.get(ext, ('fa5s.file', '#A9A9A9'))
+            
+            if self.config_mgr.theme.get("mode") == "dark":
+                 if color == '#000000': color = '#FFFFFF'
+                    
+            return qta.icon(icon_name, color=color)
+        except Exception:
+            return qta.icon('fa5s.file', color='#A9A9A9')
+
     def on_item_double_click(self, item, column):
         if not self.ssh_mgr.is_connected or not self.ssh_mgr.sftp: return
         try:
             item_text = item.text(0)
-            filename = item_text.split(" ", 1)[1].strip() if len(item_text.split(" ", 1)) > 1 else item_text.strip()
+            filename = item_text.strip()
             item_type = item.text(2)
             new_path = f"/{filename}" if self.remote_path == "/" else posixpath.join(self.remote_path, filename)
             
@@ -1149,39 +1311,36 @@ class Interface(QMainWindow):
             size /= 1024.0
         return f"{size:.1f} TB"
 
-    def get_file_icon(self, filename):
-        ext = os.path.splitext(filename)[1].lower()
-        icons = {
-            '.py': '🐍', '.txt': '📝', '.csv': '📊', '.tsv': '📊', '.json': '📋', 
-            '.sh': '🐚', '.fastq': '🧬', '.fasta': '🧬', '.fna': '🧬', '.gbk': '🧬', 
-            '.gbff': '🧬', '.png': '🖼️', '.jpg': '🖼️', '.jpeg': '🖼️', '.svg': '🖼️',
-            '.tar': '📦', '.gz': '📦', '.zip': '📦'
-        }
-        return icons.get(ext, '📄')
-
     def update_explorer_slot(self):
         if not self.ssh_mgr.is_connected or not self.ssh_mgr.sftp: return
         lang = self.config_mgr.language
-        
         
         if self.active_transfers: 
             return 
             
         try:
             self.explorer.clear()
-            self.current_path.setText(self.remote_path)
+            self.update_path_label()
             with self.ssh_mgr.lock: files = self.ssh_mgr.sftp.listdir_attr(self.remote_path)
             files.sort(key=lambda x: (not stat.S_ISDIR(x.st_mode), x.filename.lower()))
             for f in files:
-                icon = "📁" if stat.S_ISDIR(f.st_mode) else self.get_file_icon(f.filename)
-                ftype = t("directory", lang) if stat.S_ISDIR(f.st_mode) else t("file", lang)
-                size = "-" if stat.S_ISDIR(f.st_mode) else self.format_file_size(f.st_size)
-                item = QTreeWidgetItem([f"{icon}  {f.filename}", size, ftype, stat.filemode(f.st_mode), ""])
-                self.explorer.addTopLevelItem(item)
+                try:
+                    is_dir = stat.S_ISDIR(f.st_mode)
+                    qicon = self.get_file_icon(f.filename, is_dir=is_dir)
+                    
+                    ftype = t("directory", lang) if is_dir else t("file", lang)
+                    size = "-" if is_dir else self.format_file_size(f.st_size)
+                    
+                    item = QTreeWidgetItem([f.filename, size, ftype, stat.filemode(f.st_mode), ""])
+                    item.setIcon(0, qicon)
+                    self.explorer.addTopLevelItem(item)
+                except Exception:
+                    pass
             
             if self.filter_input.text():
                 self.filter_explorer(self.filter_input.text())
-        except: pass
+        except Exception:
+            pass
 
     def update_progress_slot(self, transferred, total, transfer_id):
         if transfer_id in self.active_transfers:
@@ -1197,7 +1356,8 @@ class Interface(QMainWindow):
 
     def create_upload_item(self, local_path):
         filename = os.path.basename(local_path)
-        item = QTreeWidgetItem([f"⬆️  {filename}", "-", t("uploading", self.config_mgr.language), "-", ""])
+        item = QTreeWidgetItem([f"  {filename}", "-", t("uploading", self.config_mgr.language), "-", ""])
+        item.setIcon(0, qta.icon('fa5s.arrow-up', color='white'))
         self.explorer.addTopLevelItem(item)
         pbar = QProgressBar()
         pbar.setFixedHeight(12)
@@ -1319,8 +1479,9 @@ class Interface(QMainWindow):
             host_str = self.entry_host.text()
             u, h = host_str.split("@") if "@" in host_str else ("user", host_str)
             key_path = self.entry_key.text()
+            use_x11 = self.chk_x11.isChecked()
             
-            self.ssh_mgr.connect(h, u, password=self.entry_pass.text(), key_filename=key_path)
+            self.ssh_mgr.connect(h, u, password=self.entry_pass.text(), key_filename=key_path, use_x11=use_x11)
             
             try:
                 stdin, stdout, stderr = self.ssh_mgr.execute("pwd")
@@ -1337,7 +1498,8 @@ class Interface(QMainWindow):
             self.sig_explorer.emit()
         except Exception as e:
             self.sig_conn_state.emit(True, t("connect", lang))
-            self.sig_msg.emit("error", t("error", lang), str(e))
+            error_msg = str(e) if str(e) else "Não foi possível conectar. Verifique os dados ou a rede."
+            self.sig_msg.emit("error", t("error", lang), f"Erro de Conexão:\n{error_msg}")
 
     def fetch_os_thread(self):
         info = backend.fetch_os_info(self.ssh_mgr)
@@ -1401,8 +1563,3 @@ class Interface(QMainWindow):
                 "key": self.entry_key.text()
             }
             self.config_mgr.save_config()
-            
-            self.cb_sessions.clear()
-            self.cb_sessions.addItem(t("new_session", lang))
-            self.cb_sessions.addItems(self.config_mgr.sessions.keys())
-            self.cb_sessions.setCurrentText(name)
