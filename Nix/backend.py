@@ -38,7 +38,6 @@ def parse_monitor_output(output):
 
 def fetch_os_info(ssh_mgr):
     try:
-        # Usando Raw String (r"") para evitar problemas do python interpretando escapes do bash (\n) e cifrões
         cmd = r"""
         if command -v neofetch >/dev/null 2>&1; then
             neofetch --stdout
