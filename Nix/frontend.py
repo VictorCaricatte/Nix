@@ -14,7 +14,7 @@ from PyQt6.QtWidgets import (
     QSplitter, QFrame, QLabel, QLineEdit, QPushButton, QTreeWidget, 
     QTreeWidgetItem, QPlainTextEdit, QProgressBar, QSizePolicy,
     QFileDialog, QInputDialog, QMessageBox, QMenu, QColorDialog,
-    QDockWidget, QTabWidget, QTextEdit, QCheckBox
+    QDockWidget, QTabWidget, QTextEdit, QCheckBox, QComboBox, QListWidget
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QEvent, QMimeData, QUrl
 from PyQt6.QtGui import QColor, QAction, QDrag, QPixmap
@@ -24,7 +24,11 @@ from ssh import SSHManager
 import backend
 from i18n import t
 from widgets import ExplorerTree
-from dialogs import RemoteEditorDialog, ImageViewerDialog, TextViewerDialog, ScreensManagerDialog, EnvManagerDialog, TableViewerDialog
+from dialogs import (
+    RemoteEditorDialog, ImageViewerDialog, TextViewerDialog, 
+    ScreensManagerDialog, EnvManagerDialog, TableViewerDialog,
+    AdvancedSearchDialog  
+)
 
 def resource_path(relative_path):
     try:
@@ -33,9 +37,28 @@ def resource_path(relative_path):
         base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
 
+class InteractiveTerminal(QPlainTextEdit):
+    def __init__(self, parent_ui=None):
+        super().__init__()
+        self.parent_ui = parent_ui
+
+    def keyPressEvent(self, event):
+        if self.parent_ui and self.parent_ui.ssh_mgr.is_connected and self.parent_ui.ssh_mgr.shell:
+            if event.key() == Qt.Key.Key_Return or event.key() == Qt.Key.Key_Enter:
+                self.parent_ui.ssh_mgr.shell.send('\r')
+            elif event.key() == Qt.Key.Key_Backspace:
+                self.parent_ui.ssh_mgr.shell.send('\x08')
+            elif event.key() == Qt.Key.Key_Tab:
+                self.parent_ui.ssh_mgr.shell.send('\t')
+            elif event.text():
+                self.parent_ui.ssh_mgr.shell.send(event.text())
+            return
+        super().keyPressEvent(event)
+
+
 class Interface(QMainWindow):
     sig_log = pyqtSignal(str)
-    sig_monitor = pyqtSignal(float, float, list)
+    sig_monitor = pyqtSignal(float, float, list, dict, list, dict)
     sig_os_info = pyqtSignal(str)
     sig_explorer = pyqtSignal()
     sig_screens = pyqtSignal(object, str)
@@ -68,6 +91,10 @@ class Interface(QMainWindow):
         self.command_history = []
         self.history_index = -1
         self.active_transfers = {}
+        
+        self.last_rx = 0
+        self.last_tx = 0
+        self.last_time = 0
 
         self.sig_log.connect(self.log_local_slot)
         self.sig_monitor.connect(self.update_monitor_ui_slot)
@@ -152,11 +179,27 @@ class Interface(QMainWindow):
         self.btn_font_up.setText(t("font_up", lang))
         self.btn_font_down.setText(t("font_down", lang))
         
-        self.lbl_proc.setText(f" {t('processes', lang)}")
+        self.combo_sessions.setItemText(0, t("saved_sessions", lang))
+        
         self.sys_tabs.setTabText(0, t("sys_mon", lang))
         self.sys_tabs.setTabText(1, t("os_info", lang))
+        if self.sys_tabs.count() > 2:
+            self.sys_tabs.setTabText(2, t("snippets_tab", lang))
+            
+        self.lbl_cpu_t.setText(t("cpu", lang))
+        self.lbl_ram_t.setText(t("ram", lang))
+        self.lbl_net_t.setText(t("network_active", lang))
+        self.lbl_users.setText(t("active_users", lang))
+        self.lbl_procs.setText(t("processes", lang))
         
-        self.proc_tree.setHeaderLabels([t("process", lang), t("cpu", lang), t("mem", lang)])
+        self.proc_tree.setHeaderLabels([t("pid", lang), t("user", lang), "CPU%", "Mem%", t("process", lang)])
+        
+        self.input_snip_name.setPlaceholderText(t("snippet_name", lang))
+        self.input_snip_cmd.setPlaceholderText(t("snippet_cmd", lang))
+        self.btn_add_snip.setText(t("add_snippet", lang))
+        self.btn_del_snip.setText(t("del_snippet", lang))
+        self.btn_run_snip.setText(t("run_snippet", lang))
+        
         self.explorer.setHeaderLabels([t("name", lang), t("size", lang), t("type", lang), t("permissions", lang), "Progress"])
         self.explorer.setColumnWidth(4, 120)
         
@@ -208,14 +251,17 @@ class Interface(QMainWindow):
             term_weight = "normal"
             term_bg_eff = term_bg
             
+        # FIX: Adicionado "QComboBox QAbstractItemView" para arrumar a cor da lista suspensa no modo Light/Dark
         return f"""
         QMainWindow, QDialog {{ background-color: {bg}; color: {fg}; }}
         QWidget {{ font-family: 'Segoe UI', sans-serif; color: {fg}; }}
         QDockWidget {{ color: {accent}; font-weight: bold; titlebar-close-icon: url(''); titlebar-normal-icon: url(''); }}
         QDockWidget::title {{ background: {card}; padding: 6px; border-bottom: 2px solid {accent}; }}
         QFrame#Card {{ background-color: {card}; border-radius: 12px; border: 1px solid {border}; }}
-        QLineEdit {{ background-color: {bg}; color: {fg}; border: 1px solid {input_border}; border-radius: 6px; padding: 6px; }}
-        QLineEdit:focus {{ border: 1px solid {accent}; }}
+        QLineEdit, QComboBox {{ background-color: {bg}; color: {fg}; border: 1px solid {input_border}; border-radius: 6px; padding: 6px; }}
+        QLineEdit:focus, QComboBox:focus {{ border: 1px solid {accent}; }}
+        QComboBox::drop-down {{ border: none; }}
+        QComboBox QAbstractItemView {{ background-color: {bg}; color: {fg}; selection-background-color: {accent}; selection-color: white; }}
         QPushButton {{ background-color: {accent}; color: white; border-radius: 6px; padding: 6px 14px; font-weight: bold; border: none; }}
         QPushButton:hover {{ background-color: {fg}; color: {hover_fg}; }}
         QPushButton:disabled {{ background-color: {btn_disabled_bg}; color: {btn_disabled_fg}; }}
@@ -395,6 +441,7 @@ class Interface(QMainWindow):
         self.apply_theme()
 
     def create_core_widgets(self):
+        lang = self.config_mgr.language
         self.conn_inner = self.create_card()
         conn_layout = QHBoxLayout(self.conn_inner)
         conn_layout.setContentsMargins(10, 5, 5, 5)
@@ -403,6 +450,11 @@ class Interface(QMainWindow):
         pixmap = QPixmap(resource_path("Nix.jpg")) 
         if not pixmap.isNull():
             self.logo_label.setPixmap(pixmap.scaled(32, 32, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+        
+        self.combo_sessions = QComboBox()
+        self.combo_sessions.addItem(t("saved_sessions", lang))
+        self.combo_sessions.addItems(self.config_mgr.sessions.keys())
+        self.combo_sessions.currentTextChanged.connect(self.load_session)
         
         self.entry_host = QLineEdit()
         self.entry_pass = QLineEdit()
@@ -465,6 +517,7 @@ class Interface(QMainWindow):
         self.btn_lang.clicked.connect(self.toggle_language)
 
         conn_layout.addWidget(self.logo_label)
+        conn_layout.addWidget(self.combo_sessions)
         conn_layout.addWidget(self.entry_host)
         conn_layout.addWidget(self.entry_pass)
         conn_layout.addWidget(self.entry_key)
@@ -535,9 +588,19 @@ class Interface(QMainWindow):
         path_layout.addWidget(self.btn_down)
         exp_layout.addLayout(path_layout)
         
+        search_layout = QHBoxLayout()
         self.filter_input = QLineEdit()
         self.filter_input.textChanged.connect(self.filter_explorer)
-        exp_layout.addWidget(self.filter_input)
+        
+        # NOVO: Botão de Busca Remota Profunda
+        self.btn_search = QPushButton()
+        self.btn_search.setIcon(qta.icon('fa5s.search', color='white'))
+        self.btn_search.setToolTip(t("deep_search", lang))
+        self.btn_search.clicked.connect(self.show_search_dialog)
+        
+        search_layout.addWidget(self.filter_input)
+        search_layout.addWidget(self.btn_search)
+        exp_layout.addLayout(search_layout)
 
         self.explorer = ExplorerTree()
         self.explorer.setSelectionMode(QTreeWidget.SelectionMode.ExtendedSelection)
@@ -579,7 +642,7 @@ class Interface(QMainWindow):
         top_term_layout.addWidget(self.lbl_screen_status)
         term_layout.addLayout(top_term_layout)
         
-        self.output = QPlainTextEdit()
+        self.output = InteractiveTerminal(self)
         self.output.setReadOnly(True)
         term_layout.addWidget(self.output)
 
@@ -611,14 +674,16 @@ class Interface(QMainWindow):
         
         self.sys_tabs = QTabWidget()
         
+        # TAB MONITOR 
         self.tab_monitor = QWidget()
         tab_monitor_layout = QVBoxLayout(self.tab_monitor)
         
         stats_layout = QHBoxLayout()
         
+        # CPU
         cpu_layout = QVBoxLayout()
-        lbl_cpu_t = QLabel("CPU")
-        lbl_cpu_t.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_cpu_t = QLabel(t("cpu", lang))
+        self.lbl_cpu_t.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.cpu_label = QLabel("0%")
         self.cpu_label.setObjectName("MonitorValue")
         self.cpu_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -626,13 +691,14 @@ class Interface(QMainWindow):
         self.cpu_bar.setRange(0, 100)
         self.cpu_bar.setFixedHeight(8)
         self.cpu_bar.setTextVisible(False)
-        cpu_layout.addWidget(lbl_cpu_t)
+        cpu_layout.addWidget(self.lbl_cpu_t)
         cpu_layout.addWidget(self.cpu_label)
         cpu_layout.addWidget(self.cpu_bar)
         
+        # RAM
         ram_layout = QVBoxLayout()
-        lbl_ram_t = QLabel("RAM")
-        lbl_ram_t.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_ram_t = QLabel(t("ram", lang))
+        self.lbl_ram_t.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.ram_label = QLabel("0%")
         self.ram_label.setObjectName("MonitorValue")
         self.ram_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -640,22 +706,76 @@ class Interface(QMainWindow):
         self.ram_bar.setRange(0, 100)
         self.ram_bar.setFixedHeight(8)
         self.ram_bar.setTextVisible(False)
-        ram_layout.addWidget(lbl_ram_t)
+        self.lbl_mem_details = QLabel(f"{t('mem_free', lang)}: - / {t('mem_total', lang)}: -")
+        self.lbl_mem_details.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_mem_details.setStyleSheet("font-size: 11px; color: #888;")
+        ram_layout.addWidget(self.lbl_ram_t)
         ram_layout.addWidget(self.ram_label)
         ram_layout.addWidget(self.ram_bar)
+        ram_layout.addWidget(self.lbl_mem_details)
+
+        # REDE
+        net_layout = QVBoxLayout()
+        self.lbl_net_t = QLabel(t("network_active", lang))
+        self.lbl_net_t.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_net_rx = QLabel("▼ 0 B/s")
+        self.lbl_net_tx = QLabel("▲ 0 B/s")
+        self.lbl_net_rx.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_net_tx.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_net_rx.setStyleSheet("color: #28a745; font-weight: bold; font-size: 14px;")
+        self.lbl_net_tx.setStyleSheet("color: #17a2b8; font-weight: bold; font-size: 14px;")
+        net_layout.addWidget(self.lbl_net_t)
+        net_layout.addWidget(self.lbl_net_rx)
+        net_layout.addWidget(self.lbl_net_tx)
         
         stats_layout.addLayout(cpu_layout)
         stats_layout.addLayout(ram_layout)
+        stats_layout.addLayout(net_layout)
         tab_monitor_layout.addLayout(stats_layout)
         
-        self.lbl_proc = QLabel()
-        self.lbl_proc.setObjectName("Title")
-        tab_monitor_layout.addWidget(self.lbl_proc)
-        
-        self.proc_tree = QTreeWidget()
-        self.proc_tree.setColumnWidth(0, 120)
-        tab_monitor_layout.addWidget(self.proc_tree)
+        divider = QFrame()
+        divider.setFrameShape(QFrame.Shape.HLine)
+        divider.setStyleSheet("background-color: #444;")
+        tab_monitor_layout.addWidget(divider)
 
+        bottom_monitor_layout = QHBoxLayout()
+
+        # Usuários
+        users_vbox = QVBoxLayout()
+        self.lbl_users = QLabel(t("active_users", lang))
+        self.lbl_users.setObjectName("Title")
+        self.users_list = QListWidget()
+        self.users_list.setFixedWidth(140)
+        
+        # NOVO: Context Menu para os Usuários
+        self.users_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.users_list.customContextMenuRequested.connect(self.show_users_context_menu)
+        
+        users_vbox.addWidget(self.lbl_users)
+        users_vbox.addWidget(self.users_list)
+
+        # Processos Interativos
+        procs_vbox = QVBoxLayout()
+        self.lbl_procs = QLabel(t("processes", lang))
+        self.lbl_procs.setObjectName("Title")
+        self.proc_tree = QTreeWidget()
+        self.proc_tree.setHeaderLabels([t("pid", lang), t("user", lang), "CPU%", "Mem%", t("process", lang)])
+        self.proc_tree.setColumnWidth(0, 50)
+        self.proc_tree.setColumnWidth(1, 70)
+        self.proc_tree.setColumnWidth(2, 50)
+        self.proc_tree.setColumnWidth(3, 50)
+        
+        self.proc_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.proc_tree.customContextMenuRequested.connect(self.show_proc_context_menu)
+        
+        procs_vbox.addWidget(self.lbl_procs)
+        procs_vbox.addWidget(self.proc_tree)
+
+        bottom_monitor_layout.addLayout(users_vbox)
+        bottom_monitor_layout.addLayout(procs_vbox)
+        tab_monitor_layout.addLayout(bottom_monitor_layout)
+
+        # TAB OS INFO
         self.tab_os = QWidget()
         tab_os_layout = QVBoxLayout(self.tab_os)
         self.os_info_text = QTextEdit()
@@ -663,10 +783,167 @@ class Interface(QMainWindow):
         self.os_info_text.setStyleSheet("font-family: 'Consolas', monospace; font-size: 14px;")
         tab_os_layout.addWidget(self.os_info_text)
 
-        self.sys_tabs.addTab(self.tab_monitor, "Monitor")
-        self.sys_tabs.addTab(self.tab_os, "OS Info")
+        # TAB SNIPPETS
+        self.tab_snippets = QWidget()
+        tab_snip_layout = QVBoxLayout(self.tab_snippets)
+        
+        self.list_snippets = QListWidget()
+        # NOVO: Duplo clique para executar Snippet
+        self.list_snippets.itemDoubleClicked.connect(self.run_selected_snippet)
+        
+        tab_snip_layout.addWidget(self.list_snippets)
+        
+        controls_layout = QHBoxLayout()
+        self.input_snip_name = QLineEdit()
+        self.input_snip_name.setPlaceholderText(t("snippet_name", lang))
+        self.input_snip_cmd = QLineEdit()
+        self.input_snip_cmd.setPlaceholderText(t("snippet_cmd", lang))
+        controls_layout.addWidget(self.input_snip_name)
+        controls_layout.addWidget(self.input_snip_cmd)
+        
+        btn_layout = QHBoxLayout()
+        self.btn_add_snip = QPushButton(t("add_snippet", lang))
+        self.btn_add_snip.setStyleSheet("background-color: #28a745; color: white;")
+        self.btn_add_snip.clicked.connect(self.add_snippet)
+        
+        self.btn_del_snip = QPushButton(t("del_snippet", lang))
+        self.btn_del_snip.setStyleSheet("background-color: #dc3545; color: white;")
+        self.btn_del_snip.clicked.connect(self.del_snippet)
+        
+        self.btn_run_snip = QPushButton(t("run_snippet", lang))
+        self.btn_run_snip.setStyleSheet("background-color: #007bff; color: white;")
+        self.btn_run_snip.clicked.connect(self.run_selected_snippet)
+        
+        btn_layout.addWidget(self.btn_add_snip)
+        btn_layout.addWidget(self.btn_del_snip)
+        btn_layout.addWidget(self.btn_run_snip)
+        
+        tab_snip_layout.addLayout(controls_layout)
+        tab_snip_layout.addLayout(btn_layout)
+        
+        self.load_snippets_ui()
+
+        self.sys_tabs.addTab(self.tab_monitor, t("sys_mon", lang))
+        self.sys_tabs.addTab(self.tab_os, t("os_info", lang))
+        self.sys_tabs.addTab(self.tab_snippets, t("snippets_tab", lang))
         
         sys_layout.addWidget(self.sys_tabs)
+
+    def show_search_dialog(self):
+        if not self.ssh_mgr.is_connected: return
+        self.search_dialog = AdvancedSearchDialog(self)
+        self.search_dialog.show()
+
+    def show_users_context_menu(self, pos):
+        item = self.users_list.itemAt(pos)
+        if not item: return
+        user_info = item.text()
+        
+        # user_info é geralmente no formato: root (pts/0)
+        user_name = user_info.split()[0]
+        tty = user_info.split("(")[1].strip(")") if "(" in user_info else ""
+        
+        lang = self.config_mgr.language
+        menu = QMenu(self)
+        
+        act_disconnect = QAction(qta.icon('fa5s.user-slash', color='red'), f"{t('disconnect', lang)} {user_name}", self)
+        act_disconnect.triggered.connect(lambda: self.kill_user_session(user_name, tty))
+        
+        menu.addAction(act_disconnect)
+        menu.exec(self.users_list.viewport().mapToGlobal(pos))
+
+    def kill_user_session(self, user, tty):
+        if not self.ssh_mgr.is_connected: return
+        lang = self.config_mgr.language
+        reply = QMessageBox.question(self, t("confirm", lang), f"Desconectar força o fechamento dos processos de {user}. Confirmar?")
+        if reply == QMessageBox.StandardButton.Yes:
+            if tty:
+                cmd = f"sudo pkill -9 -t {tty.replace('/dev/', '')} || pkill -9 -t {tty.replace('/dev/', '')}"
+            else:
+                cmd = f"sudo pkill -9 -u {user} || pkill -9 -u {user}"
+            self.ssh_mgr.execute(cmd)
+            self.sig_log.emit(f"[{cmd}]")
+
+    def load_snippets_ui(self):
+        self.list_snippets.clear()
+        if not self.config_mgr.snippets:
+            self.config_mgr.snippets = {
+                "System Info": "uname -a",
+                "Disk Usage": "df -h",
+                "Update Ubuntu/Debian": "sudo apt update && sudo apt upgrade -y",
+                "Clear RAM Cache": "sudo sync; echo 3 | sudo tee /proc/sys/vm/drop_caches",
+                "List Docker Containers": "docker ps -a",
+                "Network Open Ports": "netstat -tulpn | grep LISTEN"
+            }
+            self.config_mgr.save_config()
+
+        for name, cmd in self.config_mgr.snippets.items():
+            self.list_snippets.addItem(f"{name}  ➡️  {cmd}")
+
+    def add_snippet(self):
+        name = self.input_snip_name.text().strip()
+        cmd = self.input_snip_cmd.text().strip()
+        if name and cmd:
+            self.config_mgr.snippets[name] = cmd
+            self.config_mgr.save_config()
+            self.input_snip_name.clear()
+            self.input_snip_cmd.clear()
+            self.load_snippets_ui()
+
+    def del_snippet(self):
+        sel = self.list_snippets.currentItem()
+        if sel:
+            text = sel.text()
+            name = text.split("  ➡️  ")[0]
+            if name in self.config_mgr.snippets:
+                del self.config_mgr.snippets[name]
+                self.config_mgr.save_config()
+                self.load_snippets_ui()
+
+    def run_selected_snippet(self):
+        sel = self.list_snippets.currentItem()
+        if sel:
+            text = sel.text()
+            cmd = text.split("  ➡️  ")[1]
+            if self.ssh_mgr.is_connected and self.ssh_mgr.shell:
+                self.ssh_mgr.shell.send(cmd + "\r")
+                self.sig_log.emit(f"[Snippet: {cmd}]")
+
+    def show_proc_context_menu(self, pos):
+        item = self.proc_tree.itemAt(pos)
+        if not item: return
+        pid = item.text(0)
+        pname = item.text(4)
+        lang = self.config_mgr.language
+
+        menu = QMenu(self)
+        
+        action_term = QAction(qta.icon('fa5s.hand-paper', color='orange'), f"{t('kill_term', lang)} {pid} ({pname})", self)
+        action_term.triggered.connect(lambda: self.kill_process(pid, force=False))
+        
+        action_kill = QAction(qta.icon('fa5s.skull', color='red'), f"{t('kill_force', lang)} {pid} ({pname})", self)
+        action_kill.triggered.connect(lambda: self.kill_process(pid, force=True))
+        
+        menu.addAction(action_term)
+        menu.addAction(action_kill)
+        menu.exec(self.proc_tree.viewport().mapToGlobal(pos))
+
+    def kill_process(self, pid, force=False):
+        if not self.ssh_mgr.is_connected: return
+        lang = self.config_mgr.language
+        signal = "-9" if force else ""
+        cmd = f"kill {signal} {pid}".strip()
+        try:
+            self.ssh_mgr.execute(cmd)
+            self.sig_log.emit(f"[{cmd}]")
+        except Exception as e:
+            self.sig_log.emit(f"{t('error_kill', lang)} {e}")
+
+    def load_session(self, name):
+        if name in self.config_mgr.sessions:
+            data = self.config_mgr.sessions[name]
+            self.entry_host.setText(data.get("host", ""))
+            self.entry_key.setText(data.get("key", ""))
 
     def open_new_window(self):
         if getattr(sys, 'frozen', False):
@@ -736,62 +1013,66 @@ class Interface(QMainWindow):
 
     def show_context_menu(self, pos):
         if not self.ssh_mgr.is_connected: return
-        item = self.explorer.itemAt(pos)
-        if not item: return
-        
         lang = self.config_mgr.language
         menu = QMenu(self)
         
-        action_open = QAction(qta.icon('fa5s.folder-open', color='white'), t("open", lang), self)
-        action_open.triggered.connect(lambda: self.on_item_double_click(item, 0))
-        
-        action_edit = QAction(qta.icon('fa5s.edit', color='white'), t("edit_nano", lang), self)
-        action_edit.triggered.connect(lambda: self.ctx_edit(item))
-        
+        # Ações Globais (Mesmo sem item selecionado)
         action_mkdir = QAction(qta.icon('fa5s.folder-plus', color='white'), t("new_folder", lang), self)
         action_mkdir.triggered.connect(self.shortcut_mkdir)
         
-        action_copy = QAction(qta.icon('fa5s.copy', color='white'), t("copy_path", lang), self)
-        action_copy.triggered.connect(lambda: self.ctx_copy_path(item))
+        action_new_file = QAction(qta.icon('fa5s.file-medical', color='white'), "Novo Arquivo", self)
+        action_new_file.triggered.connect(self.shortcut_new_file)
         
-        action_rename = QAction(qta.icon('fa5s.i-cursor', color='white'), t("rename", lang), self)
-        action_rename.triggered.connect(lambda: self.ctx_rename(item))
-        
-        action_move = QAction(qta.icon('fa5s.people-carry', color='white'), t("move", lang), self)
-        action_move.triggered.connect(lambda: self.ctx_move(item))
-        
-        action_delete = QAction(qta.icon('fa5s.trash-alt', color='white'), t("delete", lang), self)
-        action_delete.triggered.connect(lambda: self.ctx_delete(item))
-        
-        menu.addSeparator()
-        
-        filename, new_path, item_type = self.get_item_info(item)
-        
-        if item_type == "Directory" or item_type == t("directory", lang):
-            action_compress = QAction(qta.icon('fa5s.file-archive', color='white'), t("compress", lang), self)
-            action_compress.triggered.connect(lambda: self.ctx_compress(new_path, filename))
-            menu.addAction(action_compress)
-            
-        elif filename.endswith(('.tar.gz', '.tgz', '.zip', '.tar')):
-            action_extract = QAction(qta.icon('fa5s.box-open', color='white'), t("extract", lang), self)
-            action_extract.triggered.connect(lambda: self.ctx_extract(new_path, filename))
-            menu.addAction(action_extract)
-
-        menu.addSeparator()
-        action_props = QAction(qta.icon('fa5s.info-circle', color='white'), t("properties", lang), self)
-        action_props.triggered.connect(lambda: self.ctx_properties(item))
-        
-        menu.addAction(action_open)
-        menu.addAction(action_edit)
-        menu.addSeparator()
         menu.addAction(action_mkdir)
-        menu.addAction(action_copy)
-        menu.addAction(action_rename)
-        menu.addAction(action_move)
-        menu.addSeparator()
-        menu.addAction(action_delete)
-        menu.addAction(action_props)
+        menu.addAction(action_new_file)
         
+        item = self.explorer.itemAt(pos)
+        if item:
+            menu.addSeparator()
+            action_open = QAction(qta.icon('fa5s.folder-open', color='white'), t("open", lang), self)
+            action_open.triggered.connect(lambda: self.on_item_double_click(item, 0))
+            
+            action_edit = QAction(qta.icon('fa5s.edit', color='white'), t("edit_nano", lang), self)
+            action_edit.triggered.connect(lambda: self.ctx_edit(item))
+            
+            action_copy = QAction(qta.icon('fa5s.copy', color='white'), t("copy_path", lang), self)
+            action_copy.triggered.connect(lambda: self.ctx_copy_path(item))
+            
+            action_rename = QAction(qta.icon('fa5s.i-cursor', color='white'), t("rename", lang), self)
+            action_rename.triggered.connect(lambda: self.ctx_rename(item))
+            
+            action_move = QAction(qta.icon('fa5s.people-carry', color='white'), t("move", lang), self)
+            action_move.triggered.connect(lambda: self.ctx_move(item))
+            
+            action_delete = QAction(qta.icon('fa5s.trash-alt', color='white'), t("delete", lang), self)
+            action_delete.triggered.connect(lambda: self.ctx_delete(item))
+            
+            filename, new_path, item_type = self.get_item_info(item)
+            
+            menu.addAction(action_open)
+            menu.addAction(action_edit)
+            menu.addSeparator()
+            menu.addAction(action_copy)
+            menu.addAction(action_rename)
+            menu.addAction(action_move)
+            menu.addSeparator()
+            menu.addAction(action_delete)
+            
+            if item_type == "Directory" or item_type == t("directory", lang):
+                action_compress = QAction(qta.icon('fa5s.file-archive', color='white'), t("compress", lang), self)
+                action_compress.triggered.connect(lambda: self.ctx_compress(new_path, filename))
+                menu.addAction(action_compress)
+                
+            elif filename.endswith(('.tar.gz', '.tgz', '.zip', '.tar')):
+                action_extract = QAction(qta.icon('fa5s.box-open', color='white'), t("extract", lang), self)
+                action_extract.triggered.connect(lambda: self.ctx_extract(new_path, filename))
+                menu.addAction(action_extract)
+
+            menu.addSeparator()
+            action_props = QAction(qta.icon('fa5s.info-circle', color='white'), t("properties", lang), self)
+            action_props.triggered.connect(lambda: self.ctx_properties(item))
+            menu.addAction(action_props)
+            
         menu.exec(self.explorer.viewport().mapToGlobal(pos))
 
     def get_item_info(self, item):
@@ -828,6 +1109,20 @@ class Interface(QMainWindow):
             try:
                 target_path = posixpath.join(self.remote_path, new_dir)
                 with self.ssh_mgr.lock: self.ssh_mgr.sftp.mkdir(target_path)
+                self.sig_explorer.emit()
+            except Exception as e:
+                self.sig_msg.emit("error", t("error", lang), f"Erro: {str(e)}")
+                
+    def shortcut_new_file(self):
+        if not self.ssh_mgr.is_connected: return
+        lang = self.config_mgr.language
+        new_file, ok = QInputDialog.getText(self, "Novo Arquivo", "Nome do Arquivo (ex: main.py):")
+        if ok and new_file:
+            target_path = posixpath.join(self.remote_path, new_file)
+            try:
+                with self.ssh_mgr.lock:
+                    with self.ssh_mgr.sftp.open(target_path, 'w') as f:
+                        f.write("") # Cria um arquivo vazio
                 self.sig_explorer.emit()
             except Exception as e:
                 self.sig_msg.emit("error", t("error", lang), f"Erro: {str(e)}")
@@ -1048,7 +1343,6 @@ class Interface(QMainWindow):
         cmd = self.cmd_input.text().strip()
         if not cmd: return
         
-        # Interceptação para Elevar nativamente o SFTP junto com o shell interativo
         if cmd.startswith("sudo su ") or cmd.startswith("su ") or cmd == "sudo su" or cmd == "su" or cmd.startswith("sudo -i") or cmd.startswith("sudo -s"):
             parts = cmd.split()
             target_user = "root"
@@ -1058,7 +1352,8 @@ class Interface(QMainWindow):
                     break
             
             if not self.sudo_cache[0] and "sudo" in cmd:
-                pwd, ok = QInputDialog.getText(self, "Sudo", t("enter_sudo", self.config_mgr.language), QLineEdit.EchoMode.Password)
+                lang = self.config_mgr.language
+                pwd, ok = QInputDialog.getText(self, "Sudo", t("enter_sudo", lang), QLineEdit.EchoMode.Password)
                 if ok:
                     self.sudo_cache[0] = pwd
             
@@ -1126,7 +1421,8 @@ class Interface(QMainWindow):
         sudo_pwd = None
         if use_sudo:
             if not self.sudo_cache[0]:
-                pwd, ok = QInputDialog.getText(self, "Sudo", t("enter_sudo", self.config_mgr.language), QLineEdit.EchoMode.Password)
+                lang = self.config_mgr.language
+                pwd, ok = QInputDialog.getText(self, "Sudo", t("enter_sudo", lang), QLineEdit.EchoMode.Password)
                 if not ok: return
                 self.sudo_cache[0] = pwd
             sudo_pwd = self.sudo_cache[0]
@@ -1609,19 +1905,29 @@ class Interface(QMainWindow):
             time.sleep(0.01)
 
     def monitor_loop(self):
+        self.last_rx = 0
+        self.last_tx = 0
+        self.last_time = time.time()
+        
         while self.ssh_mgr.is_connected:
             try:
                 cmd = ("grep 'cpu ' /proc/stat; sleep 1; grep 'cpu ' /proc/stat; "
-                       "echo '==MEM=='; cat /proc/meminfo; echo '==PROCS=='; "
-                       "ps -eo pid,pcpu,pmem,comm --sort=-pcpu --no-headers | head -n 15")
+                       "echo '==MEM=='; cat /proc/meminfo; echo '==NET=='; cat /proc/net/dev; "
+                       "echo '==USERS=='; who; echo '==PROCS=='; "
+                       "ps -eo pid,user,pcpu,pmem,comm --sort=-pcpu --no-headers | head -n 15")
                 stdin, stdout, stderr = self.ssh_mgr.execute(cmd)
                 output = stdout.read().decode().strip()
                 
-                cpu_usage, mem_usage, procs = backend.parse_monitor_output(output)
-                self.sig_monitor.emit(cpu_usage, mem_usage, procs)
-            except: time.sleep(4)
+                parsed = backend.parse_monitor_output(output)
+                
+                if len(parsed) == 3:
+                    self.sig_monitor.emit(parsed[0], parsed[1], parsed[2], {}, [], {})
+                else:
+                    self.sig_monitor.emit(parsed[0], parsed[1], parsed[2], parsed[3], parsed[4], parsed[5])
+            except Exception:
+                time.sleep(4)
 
-    def update_monitor_ui_slot(self, cpu, ram, procs):
+    def update_monitor_ui_slot(self, cpu, ram, procs, net_bytes, users, mem_info):
         try:
             self.cpu_label.setText(f"{cpu:.1f}%")
             self.cpu_bar.setValue(int(cpu))
@@ -1629,11 +1935,40 @@ class Interface(QMainWindow):
             self.ram_label.setText(f"{ram:.1f}%")
             self.ram_bar.setValue(int(ram))
             
+            lang = self.config_mgr.language
+            if mem_info:
+                total = mem_info.get("total", 0)
+                avail = mem_info.get("available", 0)
+                self.lbl_mem_details.setText(f"{t('mem_free', lang)}: {avail} MB / {t('mem_total', lang)}: {total} MB")
+            
+            current_time = time.time()
+            dt = current_time - self.last_time
+            if dt > 0 and net_bytes:
+                rx = net_bytes.get('rx', 0)
+                tx = net_bytes.get('tx', 0)
+                if self.last_rx > 0:
+                    rx_speed = (rx - self.last_rx) / dt
+                    tx_speed = (tx - self.last_tx) / dt
+                    self.lbl_net_rx.setText(f"▼ {self.format_file_size(rx_speed)}/s")
+                    self.lbl_net_tx.setText(f"▲ {self.format_file_size(tx_speed)}/s")
+                self.last_rx = rx
+                self.last_tx = tx
+            self.last_time = current_time
+
             self.proc_tree.clear()
             for p in procs: 
-                item = QTreeWidgetItem([p[3], f"{p[1]}%", f"{p[2]}%"])
+                if len(p) >= 5:
+                    item = QTreeWidgetItem([p[0], p[1], f"{p[2]}%", f"{p[3]}%", p[4]])
+                else:
+                    item = QTreeWidgetItem([p[0], "-", f"{p[1]}%", f"{p[2]}%", p[3]])
                 self.proc_tree.addTopLevelItem(item)
-        except: pass
+                
+            self.users_list.clear()
+            for u in users:
+                self.users_list.addItem(u)
+                
+        except Exception:
+            pass
 
     def save_current_session(self):
         lang = self.config_mgr.language
@@ -1644,3 +1979,5 @@ class Interface(QMainWindow):
                 "key": self.entry_key.text()
             }
             self.config_mgr.save_config()
+            if self.combo_sessions.findText(name) == -1:
+                self.combo_sessions.addItem(name)
