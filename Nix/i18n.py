@@ -107,7 +107,13 @@ TRANSLATIONS = {
         "table_viewer": "Table Viewer",
         "search_table": "Search data...",
         "new_window": "New Window",
-        "x11_compress": "X11/Compress (-X -C -Y)"
+        "x11_compress": "X11/Compress (-X -C -Y)",
+        "execute_file": "Execute File",
+        "execute_prompt": "Do you want to execute the file",
+        "custom_conda_path": "Manual Conda Path (/opt/conda)",
+        "fetch_manual": "Fetch",
+        "copy_table": "Copy",
+        "save_table": "Save Changes"
     },
     "pt": {
         "new_session": "Nova Sessão",
@@ -217,7 +223,13 @@ TRANSLATIONS = {
         "table_viewer": "Visualizador de Tabelas",
         "search_table": "Buscar dados...",
         "new_window": "Nova Janela",
-        "x11_compress": "X11/Compressão (-X -C -Y)"
+        "x11_compress": "X11/Compressão (-X -C -Y)",
+        "execute_file": "Executar Arquivo",
+        "execute_prompt": "Deseja executar o arquivo",
+        "custom_conda_path": "Caminho Conda Manual (/opt/conda)",
+        "fetch_manual": "Buscar",
+        "copy_table": "Copiar",
+        "save_table": "Salvar Alterações"
     },
     "es": {
         "new_session": "Nueva Sesión",
@@ -327,7 +339,13 @@ TRANSLATIONS = {
         "table_viewer": "Visor de Tabla",
         "search_table": "Buscar datos...",
         "new_window": "Nueva Ventana",
-        "x11_compress": "X11/Comprimir (-X -C -Y)"
+        "x11_compress": "X11/Comprimir (-X -C -Y)",
+        "execute_file": "Ejecutar Archivo",
+        "execute_prompt": "¿Desea ejecutar el archivo",
+        "custom_conda_path": "Ruta Manual Conda (/opt/conda)",
+        "fetch_manual": "Buscar",
+        "copy_table": "Copiar",
+        "save_table": "Guardar Cambios"
     }
 }
 
