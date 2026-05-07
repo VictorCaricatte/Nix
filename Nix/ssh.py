@@ -11,6 +11,7 @@ class SSHManager:
         self.shell = None
         self.lock = threading.Lock()
         self.is_connected = False
+        self.sftp_user_stack = []
 
     def _x11_handler(self, channel, src_addr, src_port):
         def handle_connection():
@@ -105,7 +106,51 @@ class SSHManager:
         self.shell.invoke_shell()
         
         self.sftp = self.client.open_sftp()
+        self.sftp_user_stack = []
         self.is_connected = True
+
+    def switch_sftp_user(self, target_user, sudo_password):
+        check_cmd = f"sudo -n -u {target_user} true" if target_user != "root" else "sudo -n true"
+        _, stdout, _ = self.client.exec_command(check_cmd)
+        exit_status = stdout.channel.recv_exit_status()
+        
+        channel = self.client.get_transport().open_session()
+        sftp_paths = "/usr/lib/openssh/sftp-server /usr/libexec/openssh/sftp-server /usr/lib/sftp-server /usr/libexec/sftp-server"
+        find_cmd = f"for p in {sftp_paths}; do if [ -x $p ]; then exec $p; fi; done"
+        
+        cmd = f"sudo -S -p '' -u {target_user} sh -c '{find_cmd}'" if target_user != "root" else f"sudo -S -p '' sh -c '{find_cmd}'"
+        channel.exec_command(cmd)
+        
+        if exit_status != 0 and sudo_password:
+            channel.sendall(sudo_password + "\n")
+        
+        try:
+            new_sftp = paramiko.SFTPClient(channel)
+            with self.lock:
+                if self.sftp:
+                    self.sftp.close()
+                self.sftp = new_sftp
+                self.sftp_user_stack.append(target_user)
+            return True
+        except Exception as e:
+            channel.close()
+            raise Exception(f"Não foi possível iniciar SFTP como {target_user}. Verifique a senha ou permissões.")
+            
+    def pop_sftp_user(self, sudo_password):
+        prev = None
+        with self.lock:
+            if self.sftp_user_stack:
+                self.sftp_user_stack.pop()
+                if self.sftp:
+                    self.sftp.close()
+                if self.sftp_user_stack:
+                    prev = self.sftp_user_stack[-1]
+                    self.sftp_user_stack.pop() 
+                else:
+                    self.sftp = self.client.open_sftp()
+                    
+        if prev:
+            self.switch_sftp_user(prev, sudo_password)
 
     def execute(self, command):
         if self.client and self.is_connected:
@@ -114,6 +159,7 @@ class SSHManager:
 
     def disconnect(self):
         self.is_connected = False
+        self.sftp_user_stack.clear()
         if self.sftp:
             self.sftp.close()
         if self.client:
