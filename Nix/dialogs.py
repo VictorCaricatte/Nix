@@ -1,7 +1,7 @@
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QPlainTextEdit, QMessageBox, QPushButton, QLabel, 
     QHBoxLayout, QFrame, QTextEdit, QListWidget, QFileDialog, QLineEdit,
-    QTableView, QHeaderView
+    QTableView, QHeaderView, QApplication
 )
 from PyQt6.QtCore import Qt, QTimer, QSortFilterProxyModel
 from PyQt6.QtGui import QPixmap, QStandardItemModel, QStandardItem
@@ -18,6 +18,12 @@ try:
     HAS_PYGMENTS = True
 except ImportError:
     HAS_PYGMENTS = False
+
+try:
+    import pandas as pd
+    HAS_PANDAS = True
+except ImportError:
+    HAS_PANDAS = False
 
 from i18n import t
 
@@ -139,20 +145,34 @@ class RemoteEditorDialog(QDialog):
             QMessageBox.critical(self, t("error", self.lang), str(e))
 
 class TableViewerDialog(QDialog):
-    def __init__(self, parent, filename, content):
+    def __init__(self, parent, file_path, filename, content):
         super().__init__(parent)
+        self.parent_ui = parent
+        self.file_path = file_path
+        self.filename = filename
         self.lang = parent.config_mgr.language
+        self.delimiter = ','
+        
         self.setWindowTitle(f"{t('table_viewer', self.lang)}: {filename}")
         self.resize(1000, 700)
         
         layout = QVBoxLayout(self)
         
-        search_layout = QHBoxLayout()
+        top_layout = QHBoxLayout()
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText(t("search_table", self.lang))
         self.search_input.textChanged.connect(self.filter_table)
-        search_layout.addWidget(self.search_input)
-        layout.addLayout(search_layout)
+        top_layout.addWidget(self.search_input)
+        
+        btn_copy = QPushButton(t("copy_table", self.lang))
+        btn_copy.clicked.connect(self.copy_selection)
+        top_layout.addWidget(btn_copy)
+        
+        btn_save = QPushButton(t("save_table", self.lang))
+        btn_save.clicked.connect(self.save_table)
+        top_layout.addWidget(btn_save)
+        
+        layout.addLayout(top_layout)
         
         self.table_view = QTableView()
         self.model = QStandardItemModel()
@@ -168,30 +188,133 @@ class TableViewerDialog(QDialog):
         self.populate_data(filename, content)
         
     def populate_data(self, filename, content):
-        delimiter = '\t' if filename.lower().endswith('.tsv') else ','
-        if filename.lower().endswith('.csv') and ';' in content[:1024] and ',' not in content[:1024]:
-            delimiter = ';'
+        if filename.lower().endswith('.xlsx'):
+            if not HAS_PANDAS:
+                QMessageBox.warning(self, "Aviso", "As bibliotecas 'pandas' e 'openpyxl' são necessárias para editar .xlsx. O ambiente local não as possui.")
+                return
+            try:
+                df = pd.read_excel(io.BytesIO(content))
+                self.model.setHorizontalHeaderLabels([str(c) for c in df.columns])
+                for _, row in df.iterrows():
+                    row_items = [QStandardItem(str(cell)) for cell in row]
+                    self.model.appendRow(row_items)
+            except Exception as e:
+                QMessageBox.critical(self, t("error", self.lang), f"Erro Pandas: {str(e)}")
+        else:
+            self.delimiter = '\t' if filename.lower().endswith('.tsv') else ','
+            if filename.lower().endswith('.csv') and ';' in content[:1024] and ',' not in content[:1024]:
+                self.delimiter = ';'
+                
+            f = io.StringIO(content)
+            reader = csv.reader(f, delimiter=self.delimiter)
             
-        f = io.StringIO(content)
-        reader = csv.reader(f, delimiter=delimiter)
-        
-        try:
-            headers = next(reader)
-            self.model.setHorizontalHeaderLabels(headers)
-            
-            for row_data in reader:
-                row_items = [QStandardItem(str(cell)) for cell in row_data]
-                self.model.appendRow(row_items)
-        except StopIteration:
-            pass
-        except Exception:
-            pass
+            try:
+                headers = next(reader)
+                self.model.setHorizontalHeaderLabels(headers)
+                
+                for row_data in reader:
+                    row_items = [QStandardItem(str(cell)) for cell in row_data]
+                    self.model.appendRow(row_items)
+            except StopIteration:
+                pass
+            except Exception:
+                pass
         
         self.table_view.horizontalHeader().setStretchLastSection(True)
         self.table_view.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
 
+    def keyPressEvent(self, event):
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier and event.key() == Qt.Key.Key_C:
+            self.copy_selection()
+        else:
+            super().keyPressEvent(event)
+
+    def copy_selection(self):
+        selection = self.table_view.selectionModel().selectedIndexes()
+        if not selection: return
+        
+        rows = sorted(list(set(index.row() for index in selection)))
+        columns = sorted(list(set(index.column() for index in selection)))
+        
+        clipboard_string = ""
+        for row in rows:
+            row_data = []
+            for col in columns:
+                idx = self.proxy_model.index(row, col)
+                if idx in selection:
+                    row_data.append(str(idx.data()))
+                else:
+                    row_data.append("")
+            clipboard_string += "\t".join(row_data) + "\n"
+            
+        QApplication.clipboard().setText(clipboard_string)
+
     def filter_table(self, text):
         self.proxy_model.setFilterFixedString(text)
+
+    def save_table(self):
+        mode = 'w'
+        try:
+            if self.filename.lower().endswith('.xlsx'):
+                if not HAS_PANDAS: return
+                data = []
+                for row in range(self.model.rowCount()):
+                    row_data = []
+                    for col in range(self.model.columnCount()):
+                        item = self.model.item(row, col)
+                        row_data.append(item.text() if item else "")
+                df = pd.DataFrame(data, columns=[self.model.horizontalHeaderItem(i).text() for i in range(self.model.columnCount())])
+                output = io.BytesIO()
+                df.to_excel(output, index=False)
+                new_content = output.getvalue()
+                mode = 'wb'
+            else:
+                output = io.StringIO()
+                writer = csv.writer(output, delimiter=self.delimiter)
+                headers = [self.model.horizontalHeaderItem(i).text() for i in range(self.model.columnCount())]
+                writer.writerow(headers)
+                for row in range(self.model.rowCount()):
+                    row_data = []
+                    for col in range(self.model.columnCount()):
+                        item = self.model.item(row, col)
+                        row_data.append(item.text() if item else "")
+                    writer.writerow(row_data)
+                new_content = output.getvalue()
+
+            try:
+                with self.parent_ui.ssh_mgr.lock:
+                    with self.parent_ui.ssh_mgr.sftp.open(self.file_path, mode) as f:
+                        f.write(new_content)
+                QMessageBox.information(self, t("success", self.lang), t("saved", self.lang))
+            except Exception as e:
+                if "Permission" in str(e) or "denied" in str(e).lower():
+                    tmp_file = "$HOME/.nebula_table_tmp"
+                    with self.parent_ui.ssh_mgr.client.open_sftp() as sftp:
+                        with sftp.open(tmp_file, mode) as f:
+                            f.write(new_content)
+                            
+                    safe_path = self.file_path.replace('"', '\\"')
+                    pwd = self.parent_ui.sudo_cache[0]
+                    if not pwd:
+                        pwd = self.parent_ui._get_sudo_pwd()
+                        self.parent_ui.sudo_cache[0] = pwd
+                        
+                    if not pwd:
+                        raise Exception("SUDO cancelado")
+                        
+                    cmd = f'sudo -S mv {tmp_file} "{safe_path}" && sudo -S chown root:root "{safe_path}"'
+                    stdin, stdout, stderr = self.parent_ui.ssh_mgr.execute(cmd)
+                    stdin.write(pwd + "\n")
+                    stdin.flush()
+                    err_out = stderr.read().decode().lower()
+                    if "incorrect password" in err_out or "senha incorreta" in err_out:
+                        self.parent_ui.sudo_cache[0] = None
+                        raise Exception("Senha do sudo incorreta.")
+                    QMessageBox.information(self, t("success", self.lang), t("saved_root", self.lang))
+                else:
+                    raise e
+        except Exception as e:
+            QMessageBox.critical(self, t("error", self.lang), f"Erro ao salvar: {str(e)}")
 
 class ImageViewerDialog(QDialog):
     def __init__(self, parent, filename, img_data):
@@ -382,6 +505,16 @@ class EnvManagerDialog(QDialog):
         self.resize(700, 500)
         
         layout = QVBoxLayout(self)
+
+        custom_layout = QHBoxLayout()
+        self.custom_conda_path = QLineEdit()
+        self.custom_conda_path.setPlaceholderText(t("custom_conda_path", self.lang))
+        self.custom_conda_path.setText(self.parent_ui.config_mgr.conda_path)
+        btn_custom = QPushButton(t("fetch_manual", self.lang))
+        btn_custom.clicked.connect(self.fetch_envs_custom)
+        custom_layout.addWidget(self.custom_conda_path)
+        custom_layout.addWidget(btn_custom)
+        layout.addLayout(custom_layout)
         
         lbl = QLabel(t("fetching_envs", self.lang))
         layout.addWidget(lbl)
@@ -415,7 +548,14 @@ class EnvManagerDialog(QDialog):
 
         self.fetch_envs()
 
-    def fetch_envs(self):
+    def fetch_envs_custom(self):
+        path = self.custom_conda_path.text().strip()
+        if path:
+            self.parent_ui.config_mgr.conda_path = path
+            self.parent_ui.config_mgr.save_config()
+            self.fetch_envs(custom_path=path)
+
+    def fetch_envs(self, custom_path=None):
         def fetch():
             cmd = (
                 "source ~/.bashrc 2>/dev/null; "
@@ -425,6 +565,12 @@ class EnvManagerDialog(QDialog):
                 "$HOME/anaconda3/bin/conda info --envs 2>/dev/null || "
                 "/opt/conda/bin/conda info --envs 2>/dev/null"
             )
+            if custom_path:
+                if custom_path.endswith('bin/conda') or custom_path.endswith('/conda'):
+                    cmd += f" || {custom_path} info --envs 2>/dev/null"
+                else:
+                    cmd += f" || {posixpath.join(custom_path, 'bin/conda')} info --envs 2>/dev/null"
+                    
             try:
                 stdin, stdout, stderr = self.parent_ui.ssh_mgr.execute(cmd)
                 stdout.channel.settimeout(10.0)
