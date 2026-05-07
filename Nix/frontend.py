@@ -41,7 +41,7 @@ class Interface(QMainWindow):
     sig_screens = pyqtSignal(object, str)
     sig_viewer = pyqtSignal(str, str, str)
     sig_image_viewer = pyqtSignal(str, bytes)
-    sig_table_viewer = pyqtSignal(str, str)
+    sig_table_viewer = pyqtSignal(str, str, object)
     sig_msg = pyqtSignal(str, str, str)
     sig_conn_state = pyqtSignal(bool, str) 
     sig_env_list = pyqtSignal(object, str, list)
@@ -63,6 +63,7 @@ class Interface(QMainWindow):
         
         self.remote_path = "/home"
         self.ctrl_a_pressed = False
+        self.sudo_cache = [None]
         
         self.command_history = []
         self.history_index = -1
@@ -1022,16 +1023,57 @@ class Interface(QMainWindow):
                 self.history_index = -1
                 self.cmd_input.clear()
 
+    def _async_switch_sftp_user(self, target_user):
+        try:
+            self.ssh_mgr.switch_sftp_user(target_user, self.sudo_cache[0])
+            self.sig_log.emit(f"[Nix] SFTP Elevado! Explorador agora atua nativamente como: {target_user}")
+            try:
+                with self.ssh_mgr.lock:
+                    self.ssh_mgr.sftp.chdir(f"/home/{target_user}" if target_user != "root" else "/root")
+                    self.remote_path = self.ssh_mgr.sftp.getcwd()
+            except: pass
+            self.sig_explorer.emit()
+        except Exception as e:
+            self.sig_log.emit(f"[Nix] Falha ao elevar permissões do explorador: {str(e)}")
+
+    def _async_pop_sftp_user(self):
+        try:
+            self.ssh_mgr.pop_sftp_user(self.sudo_cache[0])
+            current = self.ssh_mgr.sftp_user_stack[-1] if self.ssh_mgr.sftp_user_stack else "padrão"
+            self.sig_log.emit(f"[Nix] SFTP Revertido! Explorador retornou ao usuário: {current}")
+            self.sig_explorer.emit()
+        except: pass
+
     def send_command(self):
         cmd = self.cmd_input.text().strip()
         if not cmd: return
+        
+        # Interceptação para Elevar nativamente o SFTP junto com o shell interativo
+        if cmd.startswith("sudo su ") or cmd.startswith("su ") or cmd == "sudo su" or cmd == "su" or cmd.startswith("sudo -i") or cmd.startswith("sudo -s"):
+            parts = cmd.split()
+            target_user = "root"
+            for p in reversed(parts):
+                if p not in ["sudo", "su", "-", "-i", "-s"]:
+                    target_user = p
+                    break
+            
+            if not self.sudo_cache[0] and "sudo" in cmd:
+                pwd, ok = QInputDialog.getText(self, "Sudo", t("enter_sudo", self.config_mgr.language), QLineEdit.EchoMode.Password)
+                if ok:
+                    self.sudo_cache[0] = pwd
+            
+            threading.Thread(target=self._async_switch_sftp_user, args=(target_user,), daemon=True).start()
+            
+        elif cmd == "exit" or cmd == "logout":
+            if self.ssh_mgr.sftp_user_stack:
+                threading.Thread(target=self._async_pop_sftp_user, daemon=True).start()
+            else:
+                self.set_screen_status(False)
         
         if cmd.startswith("screen -S") or cmd.startswith("screen -r") or cmd.startswith("screen -x"):
             parts = cmd.split()
             if len(parts) > 2: self.set_screen_status(True, parts[2])
             else: self.set_screen_status(True, "Active")
-        elif cmd == "exit":
-            self.set_screen_status(False)
         
         if cmd.startswith("nano ") or cmd.startswith("sudo nano "):
             self.process_comand_nano(cmd)
@@ -1061,12 +1103,15 @@ class Interface(QMainWindow):
                     return
                 else:
                     new_path = target if target.startswith("/") else posixpath.join(self.remote_path, target)
-                    with self.ssh_mgr.lock:
-                        self.ssh_mgr.sftp.chdir(new_path)
-                        self.remote_path = self.ssh_mgr.sftp.getcwd() or new_path
-                    self.sig_explorer.emit()
+                    try:
+                        with self.ssh_mgr.lock:
+                            self.ssh_mgr.sftp.chdir(new_path)
+                            self.remote_path = self.ssh_mgr.sftp.getcwd() or new_path
+                        self.sig_explorer.emit()
+                    except Exception as e:
+                        self.sig_log.emit(f"cd erro: {str(e)}")
             except Exception as e:
-                self.sig_log.emit(f"cd erro: {str(e)}")
+                self.sig_log.emit(f"cd erro geral: {str(e)}")
 
         if self.ssh_mgr.shell:
             self.ssh_mgr.shell.send(cmd + "\r")
@@ -1080,9 +1125,11 @@ class Interface(QMainWindow):
         
         sudo_pwd = None
         if use_sudo:
-            pwd, ok = QInputDialog.getText(self, "Sudo", t("enter_sudo", self.config_mgr.language), QLineEdit.EchoMode.Password)
-            if not ok: return
-            sudo_pwd = pwd
+            if not self.sudo_cache[0]:
+                pwd, ok = QInputDialog.getText(self, "Sudo", t("enter_sudo", self.config_mgr.language), QLineEdit.EchoMode.Password)
+                if not ok: return
+                self.sudo_cache[0] = pwd
+            sudo_pwd = self.sudo_cache[0]
 
         editor = RemoteEditorDialog(self, filename, use_sudo, sudo_pwd)
         editor.exec()
@@ -1236,24 +1283,49 @@ class Interface(QMainWindow):
             item_text = item.text(0)
             filename = item_text.strip()
             item_type = item.text(2)
+            perms = item.text(3)
             new_path = f"/{filename}" if self.remote_path == "/" else posixpath.join(self.remote_path, filename)
             
             if item_type == "Directory" or item_type == t("directory", self.config_mgr.language):
-                with self.ssh_mgr.lock: 
-                    self.ssh_mgr.sftp.chdir(new_path)
-                    self.remote_path = new_path
-                if self.ssh_mgr.shell:
-                    self.ssh_mgr.shell.send(f'cd "{self.remote_path}"\r')
-                self.sig_explorer.emit()
+                try:
+                    with self.ssh_mgr.lock: 
+                        self.ssh_mgr.sftp.chdir(new_path)
+                        self.remote_path = new_path
+                    if self.ssh_mgr.shell:
+                        self.ssh_mgr.shell.send(f'cd "{self.remote_path}"\r')
+                    self.sig_explorer.emit()
+                except Exception as e:
+                    self.sig_msg.emit("error", t("error", self.config_mgr.language), f"Acesso Negado: {str(e)}")
             else:
+                is_executable = 'x' in perms or filename.lower().endswith(('.sh', '.py', '.pl', '.js', '.appimage', '.run'))
+                if is_executable:
+                    reply = QMessageBox.question(self, t("execute_file", self.config_mgr.language), 
+                                                 f"{t('execute_prompt', self.config_mgr.language)} '{filename}'?\n\nYes: Executar | No: Visualizar",
+                                                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No | QMessageBox.StandardButton.Cancel)
+                    if reply == QMessageBox.StandardButton.Yes:
+                        cmd = f"\"{new_path}\""
+                        if filename.endswith('.py'): cmd = f"python3 \"{new_path}\""
+                        elif filename.endswith('.sh'): cmd = f"bash \"{new_path}\""
+                        elif filename.endswith('.js'): cmd = f"node \"{new_path}\""
+                        
+                        self.cmd_input.setText(cmd)
+                        self.send_command()
+                        return
+                    elif reply == QMessageBox.StandardButton.Cancel:
+                        return
+
                 threading.Thread(target=self.preview_file, args=(new_path, filename), daemon=True).start()
         except Exception as e: 
-            self.sig_msg.emit("error", t("error", self.config_mgr.language), f"Não foi possível abrir o item: {str(e)}")
+            self.sig_msg.emit("error", t("error", self.config_mgr.language), f"Erro inesperado: {str(e)}")
 
     def preview_file(self, file_path, filename):
         try:
-            with self.ssh_mgr.lock: 
-                size = self.ssh_mgr.sftp.stat(file_path).st_size
+            size = 0
+            try:
+                with self.ssh_mgr.lock: 
+                    size = self.ssh_mgr.sftp.stat(file_path).st_size
+            except Exception as e:
+                pass
             
             valid_image_exts = ('.png', '.jpg', '.jpeg', '.svg', '.gif', '.bmp')
             if filename.lower().endswith(valid_image_exts):
@@ -1265,22 +1337,26 @@ class Interface(QMainWindow):
                 self.sig_image_viewer.emit(filename, img_data)
                 return
 
-            valid_table_exts = ('.csv', '.tsv')
+            valid_table_exts = ('.csv', '.tsv', '.xlsx')
             if filename.lower().endswith(valid_table_exts):
                 if size > 15 * 1024 * 1024:
                     self.sig_msg.emit("warn", t("warning", self.config_mgr.language), t("file_large", self.config_mgr.language))
                     return
                 with self.ssh_mgr.lock:
-                    with self.ssh_mgr.sftp.open(file_path, 'r') as f:
-                        content = f.read().decode('utf-8', errors='replace')
-                self.sig_table_viewer.emit(filename, content)
+                    with self.ssh_mgr.sftp.open(file_path, 'rb') as f:
+                        if filename.lower().endswith('.xlsx'):
+                            content = f.read()
+                        else:
+                            content = f.read().decode('utf-8', errors='replace')
+                self.sig_table_viewer.emit(file_path, filename, content)
                 return
 
             lazy_exts = ('.fasta', '.fna', '.vcf', '.sam', '.fastq', '.txt', '.py', '.json', '.sh')
             is_lazy = filename.lower().endswith(lazy_exts) or size > 1024 * 1024
             
             read_size = 100 * 1024 if is_lazy else size 
-            
+            if read_size <= 0: read_size = 100 * 1024
+
             with self.ssh_mgr.lock:
                 with self.ssh_mgr.sftp.open(file_path, 'r') as f: 
                     content = f.read(read_size).decode('utf-8', errors='replace')
@@ -1290,15 +1366,16 @@ class Interface(QMainWindow):
 
             self.sig_viewer.emit(file_path, filename, content)
             
-        except Exception: 
-            pass
+        except Exception as e: 
+            if "Permission" in str(e) or "denied" in str(e).lower():
+                 self.sig_msg.emit("warn", t("warning", self.config_mgr.language), f"Acesso negado ao tentar ler '{filename}'.")
 
     def open_image_viewer_slot(self, filename, img_data):
         viewer = ImageViewerDialog(self, filename, img_data)
         viewer.show()
 
-    def open_table_viewer_slot(self, filename, content):
-        viewer = TableViewerDialog(self, filename, content)
+    def open_table_viewer_slot(self, file_path, filename, content):
+        viewer = TableViewerDialog(self, file_path, filename, content)
         viewer.show()
 
     def open_file_viewer_slot(self, file_path, filename, content):
@@ -1321,7 +1398,11 @@ class Interface(QMainWindow):
         try:
             self.explorer.clear()
             self.update_path_label()
-            with self.ssh_mgr.lock: files = self.ssh_mgr.sftp.listdir_attr(self.remote_path)
+            files = []
+            
+            with self.ssh_mgr.lock: 
+                files = self.ssh_mgr.sftp.listdir_attr(self.remote_path)
+                    
             files.sort(key=lambda x: (not stat.S_ISDIR(x.st_mode), x.filename.lower()))
             for f in files:
                 try:
