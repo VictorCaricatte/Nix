@@ -7,6 +7,7 @@ class ConfigManager:
         self.sessions = {}
         self.snippets = {"System Info": "uname -a", "Disk Usage": "df -h"}
         self.language = "en"
+        self.conda_path = ""
         
         self.theme = {
             "mode": "dark",
@@ -27,6 +28,7 @@ class ConfigManager:
                     self.snippets = data.get("snippets", self.snippets)
                     self.theme = data.get("theme", self.theme)
                     self.language = data.get("language", "en")
+                    self.conda_path = data.get("conda_path", "")
                     
                     if "layout" not in self.theme:
                         self.theme["layout"] = "classic"
@@ -44,7 +46,8 @@ class ConfigManager:
                     "sessions": self.sessions, 
                     "snippets": self.snippets,
                     "theme": self.theme,
-                    "language": self.language
+                    "language": self.language,
+                    "conda_path": self.conda_path
                 }, f, indent=4)
         except Exception:
             pass
