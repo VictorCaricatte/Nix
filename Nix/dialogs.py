@@ -1,10 +1,13 @@
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QPlainTextEdit, QMessageBox, QPushButton, QLabel, 
     QHBoxLayout, QFrame, QTextEdit, QListWidget, QFileDialog, QLineEdit,
-    QTableView, QHeaderView, QApplication
+    QTableView, QHeaderView, QApplication, QWidget, QTreeWidget, QTreeWidgetItem
 )
-from PyQt6.QtCore import Qt, QTimer, QSortFilterProxyModel
-from PyQt6.QtGui import QPixmap, QStandardItemModel, QStandardItem
+from PyQt6.QtCore import Qt, QTimer, QSortFilterProxyModel, QRect, QRegularExpression
+from PyQt6.QtGui import (
+    QPixmap, QStandardItemModel, QStandardItem, QColor, QFont, 
+    QPainter, QTextFormat, QSyntaxHighlighter, QTextCharFormat
+)
 import posixpath
 import threading
 import os
@@ -25,7 +28,143 @@ try:
 except ImportError:
     HAS_PANDAS = False
 
-from i18n import t
+from i18n import t, TRANSLATIONS
+
+class LineNumberArea(QWidget):
+    def __init__(self, editor):
+        super().__init__(editor)
+        self.codeEditor = editor
+
+    def sizeHint(self):
+        return self.codeEditor.line_number_area_width()
+
+    def paintEvent(self, event):
+        self.codeEditor.line_number_area_paint_event(event)
+
+class CodeEditor(QPlainTextEdit):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.line_number_area = LineNumberArea(self)
+        self.blockCountChanged.connect(self.update_line_number_area_width)
+        self.updateRequest.connect(self.update_line_number_area)
+        self.cursorPositionChanged.connect(self.highlight_current_line)
+        self.update_line_number_area_width(0)
+        self.highlight_current_line()
+
+    def line_number_area_width(self):
+        digits = 1
+        max_num = max(1, self.blockCount())
+        while max_num >= 10:
+            max_num //= 10
+            digits += 1
+        space = 15 + self.fontMetrics().horizontalAdvance('9') * digits
+        return space
+
+    def update_line_number_area_width(self, _):
+        self.setViewportMargins(self.line_number_area_width(), 0, 0, 0)
+
+    def update_line_number_area(self, rect, dy):
+        if dy:
+            self.line_number_area.scroll(0, dy)
+        else:
+            self.line_number_area.update(0, rect.y(), self.line_number_area.width(), rect.height())
+        if rect.contains(self.viewport().rect()):
+            self.update_line_number_area_width(0)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        cr = self.contentsRect()
+        self.line_number_area.setGeometry(QRect(cr.left(), cr.top(), self.line_number_area_width(), cr.height()))
+
+    def highlight_current_line(self):
+        extra_selections = []
+        if not self.isReadOnly():
+            selection = QTextEdit.ExtraSelection()
+            line_color = QColor("#2a2a35") 
+            selection.format.setBackground(line_color)
+            selection.format.setProperty(QTextFormat.Property.FullWidthSelection, True)
+            selection.cursor = self.textCursor()
+            selection.cursor.clearSelection()
+            extra_selections.append(selection)
+        self.setExtraSelections(extra_selections)
+
+    def line_number_area_paint_event(self, event):
+        painter = QPainter(self.line_number_area)
+        painter.fillRect(event.rect(), QColor("#1e1e2e")) 
+
+        block = self.firstVisibleBlock()
+        block_number = block.blockNumber()
+        top = round(self.blockBoundingGeometry(block).translated(self.contentOffset()).top())
+        bottom = top + round(self.blockBoundingRect(block).height())
+
+        while block.isValid() and top <= event.rect().bottom():
+            if block.isVisible() and bottom >= event.rect().top():
+                number = str(block_number + 1)
+                painter.setPen(QColor("#6c7086")) 
+                painter.drawText(0, top, self.line_number_area.width() - 5, self.fontMetrics().height(),
+                                 Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, number)
+
+            block = block.next()
+            top = bottom
+            bottom = top + round(self.blockBoundingRect(block).height())
+            block_number += 1
+
+class SyntaxHighlighter(QSyntaxHighlighter):
+    def __init__(self, document, is_dark_mode=True):
+        super().__init__(document)
+        self.highlighting_rules = []
+        
+        if is_dark_mode:
+            c_keyword = QColor("#c678dd")  
+            c_type = QColor("#e5c07b")     
+            c_string = QColor("#98c379")   
+            c_comment = QColor("#5c6370")  
+            c_number = QColor("#d19a66")   
+        else:
+            c_keyword = QColor("#a626a4")
+            c_type = QColor("#c18401")
+            c_string = QColor("#50a14f")
+            c_comment = QColor("#a0a1a7")
+            c_number = QColor("#986801")
+
+        keyword_format = QTextCharFormat()
+        keyword_format.setForeground(c_keyword)
+        keyword_format.setFontWeight(QFont.Weight.Bold)
+        keywords = [
+            "\\bdef\\b", "\\bclass\\b", "\\bimport\\b", "\\bfrom\\b", "\\bif\\b", "\\belse\\b", "\\belif\\b", 
+            "\\bwhile\\b", "\\bfor\\b", "\\bin\\b", "\\breturn\\b", "\\bbreak\\b", "\\bcontinue\\b", "\\bpass\\b",
+            "\\bvar\\b", "\\blet\\b", "\\bconst\\b", "\\bfunction\\b", "\\btrue\\b", "\\bfalse\\b", "\\bNone\\b",
+            "\\becho\\b", "\\bfi\\b", "\\bdone\\b", "\\bcase\\b", "\\besac\\b", "\\bexport\\b"
+        ]
+        for word in keywords:
+            self.highlighting_rules.append((QRegularExpression(word), keyword_format))
+
+        type_format = QTextCharFormat()
+        type_format.setForeground(c_type)
+        types = ["\\bint\\b", "\\bstr\\b", "\\bfloat\\b", "\\bbool\\b", "\\blist\\b", "\\bdict\\b", "\\bprint\\b", "\\bconsole\\b"]
+        for word in types:
+            self.highlighting_rules.append((QRegularExpression(word), type_format))
+
+        number_format = QTextCharFormat()
+        number_format.setForeground(c_number)
+        self.highlighting_rules.append((QRegularExpression("\\b[0-9]+\\b"), number_format))
+
+        self.string_format = QTextCharFormat()
+        self.string_format.setForeground(c_string)
+        self.highlighting_rules.append((QRegularExpression("\".*?\""), self.string_format))
+        self.highlighting_rules.append((QRegularExpression("'.*?'"), self.string_format))
+
+        self.comment_format = QTextCharFormat()
+        self.comment_format.setForeground(c_comment)
+        self.highlighting_rules.append((QRegularExpression("#[^\n]*"), self.comment_format))
+        self.highlighting_rules.append((QRegularExpression("//[^\n]*"), self.comment_format))
+
+    def highlightBlock(self, text):
+        for pattern, format in self.highlighting_rules:
+            iterator = pattern.globalMatch(text)
+            while iterator.hasNext():
+                match = iterator.next()
+                self.setFormat(match.capturedStart(), match.capturedLength(), format)
 
 class RemoteEditorDialog(QDialog):
     def __init__(self, parent, filename, use_sudo, sudo_pwd):
@@ -36,18 +175,20 @@ class RemoteEditorDialog(QDialog):
         self.sudo_pwd = sudo_pwd
         self.lang = parent.config_mgr.language
         
-        # Garante que o caminho seja absoluto, evitando erros no execute do SSH
         if self.filename.startswith('/'):
             self.full_path = self.filename
         else:
             self.full_path = posixpath.join(self.parent_ui.remote_path, self.filename)
         
         self.setWindowTitle(f"Nano: {filename}")
-        self.resize(900, 600)
+        self.resize(1000, 700)
         self.layout = QVBoxLayout(self)
         
-        self.txt_editor = QPlainTextEdit()
+        self.txt_editor = CodeEditor()
         self.layout.addWidget(self.txt_editor)
+        
+        is_dark = parent.config_mgr.theme.get("mode", "dark") == "dark"
+        self.highlighter = SyntaxHighlighter(self.txt_editor.document(), is_dark_mode=is_dark)
         
         nano_layout = QHBoxLayout()
         
@@ -164,11 +305,11 @@ class TableViewerDialog(QDialog):
         self.search_input.textChanged.connect(self.filter_table)
         top_layout.addWidget(self.search_input)
         
-        btn_copy = QPushButton(t("copy_table", self.lang))
+        btn_copy = QPushButton(t("copy_table", self.lang) if "copy_table" in TRANSLATIONS[self.lang] else "Copy")
         btn_copy.clicked.connect(self.copy_selection)
         top_layout.addWidget(btn_copy)
         
-        btn_save = QPushButton(t("save_table", self.lang))
+        btn_save = QPushButton(t("save_table", self.lang) if "save_table" in TRANSLATIONS[self.lang] else "Save")
         btn_save.clicked.connect(self.save_table)
         top_layout.addWidget(btn_save)
         
@@ -380,7 +521,7 @@ class TextViewerDialog(QDialog):
     def download_full(self):
         dest = QFileDialog.getExistingDirectory(self, t("destination", self.lang))
         if dest:
-            threading.Thread(target=self.parent_ui.download_thread, args=(self.file_path, os.path.join(dest, self.filename), False), daemon=True).start()
+            threading.Thread(target=self.parent_ui.download_thread, args=(self.file_path, os.path.join(dest, self.filename), False, "dl_full"), daemon=True).start()
 
 class ScreensManagerDialog(QDialog):
     def __init__(self, parent):
@@ -618,3 +759,115 @@ class EnvManagerDialog(QDialog):
         self.parent_ui.cmd_input.setText("conda deactivate")
         self.parent_ui.send_command()
         self.accept()
+
+
+class AdvancedSearchDialog(QDialog):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.parent_ui = parent
+        self.lang = parent.config_mgr.language
+        
+        title = "Advanced Search / Busca Avançada"
+        if self.lang == "pt": title = "Busca Avançada no Servidor"
+        elif self.lang == "es": title = "Búsqueda Avanzada en Servidor"
+        
+        self.setWindowTitle(title)
+        self.resize(800, 600)
+        
+        layout = QVBoxLayout(self)
+        
+        form_layout = QHBoxLayout()
+        self.input_dir = QLineEdit(self.parent_ui.remote_path)
+        self.input_dir.setPlaceholderText("Diretório Inicial (ex: /home)")
+        
+        self.input_name = QLineEdit()
+        self.input_name.setPlaceholderText("Nome do arquivo (ex: *.py)")
+        
+        self.input_content = QLineEdit()
+        self.input_content.setPlaceholderText("Conteúdo dentro do arquivo (Grep)")
+        
+        btn_search = QPushButton("Buscar" if self.lang != "en" else "Search")
+        btn_search.setStyleSheet("background-color: #007bff; color: white;")
+        btn_search.clicked.connect(self.run_search)
+        
+        form_layout.addWidget(QLabel("Dir:"))
+        form_layout.addWidget(self.input_dir)
+        form_layout.addWidget(QLabel("Nome:" if self.lang != "en" else "Name:"))
+        form_layout.addWidget(self.input_name)
+        form_layout.addWidget(QLabel("Conteúdo:" if self.lang != "en" else "Content:"))
+        form_layout.addWidget(self.input_content)
+        form_layout.addWidget(btn_search)
+        
+        layout.addLayout(form_layout)
+        
+        self.results_tree = QTreeWidget()
+        self.results_tree.setHeaderLabels(["Caminho do Arquivo", "Detalhes"])
+        self.results_tree.setColumnWidth(0, 400)
+        self.results_tree.itemDoubleClicked.connect(self.on_item_double_click)
+        layout.addWidget(self.results_tree)
+        
+    def run_search(self):
+        self.results_tree.clear()
+        search_dir = self.input_dir.text().strip() or "."
+        name = self.input_name.text().strip()
+        content = self.input_content.text().strip()
+        
+        if not name and not content:
+            QMessageBox.warning(self, "Aviso", "Preencha o campo de Nome ou Conteúdo para buscar.")
+            return
+            
+        cmd = ""
+        if content:
+            # Usa o grep recursivo para achar o texto dentro de arquivos
+            safe_content = content.replace("'", "'\\''")
+            cmd = f"grep -rn '{safe_content}' \"{search_dir}\" | head -n 100"
+        else:
+            # Usa o find para achar o arquivo pelo nome
+            safe_name = name.replace("'", "'\\''")
+            cmd = f"find \"{search_dir}\" -type f -iname '*{safe_name}*' | head -n 100"
+            
+        self.results_tree.addTopLevelItem(QTreeWidgetItem(["Buscando...", cmd]))
+        threading.Thread(target=self._do_search, args=(cmd,), daemon=True).start()
+        
+    def _do_search(self, cmd):
+        try:
+            stdin, stdout, stderr = self.parent_ui.ssh_mgr.execute(cmd)
+            out = stdout.read().decode('utf-8', errors='replace').strip()
+            err = stderr.read().decode('utf-8', errors='replace').strip()
+            QTimer.singleShot(0, lambda: self._update_results(out, err))
+        except Exception as e:
+            QTimer.singleShot(0, lambda: self._update_results("", str(e)))
+            
+    def _update_results(self, out, err):
+        self.results_tree.clear()
+        if err and not out:
+            self.results_tree.addTopLevelItem(QTreeWidgetItem(["Erro na busca", err]))
+            return
+            
+        lines = out.splitlines()
+        if not lines:
+            self.results_tree.addTopLevelItem(QTreeWidgetItem(["Nenhum resultado encontrado.", ""]))
+            return
+            
+        for line in lines:
+            parts = line.split(":", 1)
+            # Se usou Grep, ele retorna /caminho/do/arquivo:Linha_do_codigo
+            if len(parts) == 2 and self.input_content.text().strip():
+                item = QTreeWidgetItem([parts[0], parts[1].strip()])
+            else:
+                item = QTreeWidgetItem([line, "Encontrado (Find)"])
+            self.results_tree.addTopLevelItem(item)
+            
+    def on_item_double_click(self, item, col):
+        path = item.text(0)
+        if not path or path.startswith("Buscando") or path.startswith("Erro") or path.startswith("Nenhum"):
+            return
+            
+        # Ao clicar duas vezes no resultado, o File Explorer principal viaja para a pasta do arquivo
+        target_dir = posixpath.dirname(path)
+        if target_dir:
+            self.parent_ui.remote_path = target_dir
+            self.parent_ui.cmd_input.setText(f"cd \"{target_dir}\"")
+            self.parent_ui.send_command()
+        
+        self.close()
