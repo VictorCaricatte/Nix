@@ -80,21 +80,25 @@ class SSHManager:
     def connect(self, host, username, password=None, key_filename=None, use_x11=False):
         self.client = paramiko.SSHClient()
         self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        
+
         connect_kwargs = {
             "hostname": host,
             "username": username,
             "timeout": 10,
-            "compress": use_x11
+            "compress": use_x11,
+            "allow_agent": True,
+            "look_for_keys": True,
         }
-        
+
         if password:
             connect_kwargs["password"] = password
         if key_filename and key_filename.strip():
             connect_kwargs["key_filename"] = key_filename
-        
+
         self.client.connect(**connect_kwargs)
-        
+
+        self.client.get_transport().set_keepalive(30)
+
         self.shell = self.client.get_transport().open_session()
         if use_x11:
             try:
