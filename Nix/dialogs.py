@@ -1,12 +1,14 @@
 from PyQt6.QtWidgets import (
-    QDialog, QVBoxLayout, QPlainTextEdit, QMessageBox, QPushButton, QLabel, 
+    QDialog, QVBoxLayout, QPlainTextEdit, QMessageBox, QPushButton, QLabel,
     QHBoxLayout, QFrame, QTextEdit, QListWidget, QFileDialog, QLineEdit,
-    QTableView, QHeaderView, QApplication, QWidget, QTreeWidget, QTreeWidgetItem
+    QTableView, QHeaderView, QApplication, QWidget, QTreeWidget, QTreeWidgetItem,
+    QTreeView, QSizePolicy
 )
-from PyQt6.QtCore import Qt, QTimer, QSortFilterProxyModel, QRect, QRegularExpression
+from PyQt6.QtCore import (Qt, QTimer, pyqtSignal, QSortFilterProxyModel, QRect,
+                           QRegularExpression, QDir, QAbstractTableModel, QModelIndex)
 from PyQt6.QtGui import (
-    QPixmap, QStandardItemModel, QStandardItem, QColor, QFont, 
-    QPainter, QTextFormat, QSyntaxHighlighter, QTextCharFormat
+    QPixmap, QStandardItemModel, QStandardItem, QColor, QFont,
+    QPainter, QTextFormat, QSyntaxHighlighter, QTextCharFormat, QFileSystemModel
 )
 import posixpath
 import threading
@@ -285,7 +287,62 @@ class RemoteEditorDialog(QDialog):
         except Exception as e:
             QMessageBox.critical(self, t("error", self.lang), str(e))
 
+_TABLE_ROW_LIMIT = 50_000
+
+class _FastTableModel(QAbstractTableModel):
+    """Lean table model backed by a plain list — no QStandardItem overhead."""
+
+    def __init__(self, headers, rows):
+        super().__init__()
+        self._headers = headers
+        self._rows = rows
+
+    def rowCount(self, parent=QModelIndex()):
+        return len(self._rows)
+
+    def columnCount(self, parent=QModelIndex()):
+        return len(self._headers)
+
+    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
+        if not index.isValid():
+            return None
+        if role in (Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.EditRole):
+            row = self._rows[index.row()]
+            col = index.column()
+            return str(row[col]) if col < len(row) else ""
+        return None
+
+    def setData(self, index, value, role=Qt.ItemDataRole.EditRole):
+        if role == Qt.ItemDataRole.EditRole and index.isValid():
+            r, c = index.row(), index.column()
+            if r < len(self._rows) and c < len(self._rows[r]):
+                self._rows[r][c] = value
+                self.dataChanged.emit(index, index, [role])
+                return True
+        return False
+
+    def flags(self, index):
+        if not index.isValid():
+            return Qt.ItemFlag.NoItemFlags
+        return Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEditable
+
+    def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
+        if role != Qt.ItemDataRole.DisplayRole:
+            return None
+        if orientation == Qt.Orientation.Horizontal:
+            return self._headers[section] if section < len(self._headers) else str(section)
+        return str(section + 1)
+
+    def raw_rows(self):
+        return self._rows
+
+    def raw_headers(self):
+        return self._headers
+
 class TableViewerDialog(QDialog):
+
+    _sig_loaded = pyqtSignal(list, list, bool)
+
     def __init__(self, parent, file_path, filename, content):
         super().__init__(parent)
         self.parent_ui = parent
@@ -293,76 +350,99 @@ class TableViewerDialog(QDialog):
         self.filename = filename
         self.lang = parent.config_mgr.language
         self.delimiter = ','
-        
+        self._table_model = _FastTableModel([], [])
+        self._filter_text = ""
+        self._all_rows = []
+        self._headers = []
+
         self.setWindowTitle(f"{t('table_viewer', self.lang)}: {filename}")
         self.resize(1000, 700)
-        
+
         layout = QVBoxLayout(self)
-        
+
         top_layout = QHBoxLayout()
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText(t("search_table", self.lang))
-        self.search_input.textChanged.connect(self.filter_table)
+        self.search_input.textChanged.connect(self._filter_table)
         top_layout.addWidget(self.search_input)
-        
-        btn_copy = QPushButton(t("copy_table", self.lang) if "copy_table" in TRANSLATIONS[self.lang] else "Copy")
+
+        self.lbl_rows = QLabel("Loading…")
+        top_layout.addWidget(self.lbl_rows)
+
+        btn_copy = QPushButton("Copy")
         btn_copy.clicked.connect(self.copy_selection)
         top_layout.addWidget(btn_copy)
-        
-        btn_save = QPushButton(t("save_table", self.lang) if "save_table" in TRANSLATIONS[self.lang] else "Save")
+
+        btn_save = QPushButton("Save")
         btn_save.clicked.connect(self.save_table)
         top_layout.addWidget(btn_save)
-        
+
         layout.addLayout(top_layout)
-        
+
         self.table_view = QTableView()
-        self.model = QStandardItemModel()
-        self.proxy_model = QSortFilterProxyModel()
-        self.proxy_model.setSourceModel(self.model)
-        self.proxy_model.setFilterCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
-        self.proxy_model.setFilterKeyColumn(-1)
-        
-        self.table_view.setModel(self.proxy_model)
-        self.table_view.setSortingEnabled(True)
+        self.table_view.setSortingEnabled(False)
+        self.table_view.horizontalHeader().setStretchLastSection(True)
+        self.table_view.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         layout.addWidget(self.table_view)
-        
-        self.populate_data(filename, content)
-        
-    def populate_data(self, filename, content):
-        if filename.lower().endswith('.xlsx'):
-            if not HAS_PANDAS:
-                QMessageBox.warning(self, "Aviso", "As bibliotecas 'pandas' e 'openpyxl' são necessárias para editar .xlsx. O ambiente local não as possui.")
-                return
-            try:
-                df = pd.read_excel(io.BytesIO(content))
-                self.model.setHorizontalHeaderLabels([str(c) for c in df.columns])
-                for _, row in df.iterrows():
-                    row_items = [QStandardItem(str(cell)) for cell in row]
-                    self.model.appendRow(row_items)
-            except Exception as e:
-                QMessageBox.critical(self, t("error", self.lang), f"Erro Pandas: {str(e)}")
-        else:
+
+        self._sig_loaded.connect(self._apply_data)
+        threading.Thread(target=self._load_data, args=(filename, content), daemon=True).start()
+
+    def _load_data(self, filename, content):
+        """Parse file off the main thread; emit signal when done (thread-safe)."""
+        headers = []
+        rows = []
+        truncated = False
+        try:
+            if isinstance(content, (bytes, bytearray)):
+                if filename.lower().endswith('.xlsx'):
+                    if HAS_PANDAS:
+                        df = pd.read_excel(io.BytesIO(content))
+                        headers = [str(c) for c in df.columns]
+                        for _, row_data in df.iterrows():
+                            if len(rows) >= _TABLE_ROW_LIMIT:
+                                truncated = True; break
+                            rows.append([str(v) for v in row_data])
+
+                    self._sig_loaded.emit(headers, rows, truncated)
+                    return
+                else:
+                    content = content.decode('utf-8', errors='replace')
+
             self.delimiter = '\t' if filename.lower().endswith('.tsv') else ','
             if filename.lower().endswith('.csv') and ';' in content[:1024] and ',' not in content[:1024]:
                 self.delimiter = ';'
-                
-            f = io.StringIO(content)
-            reader = csv.reader(f, delimiter=self.delimiter)
-            
-            try:
-                headers = next(reader)
-                self.model.setHorizontalHeaderLabels(headers)
-                
-                for row_data in reader:
-                    row_items = [QStandardItem(str(cell)) for cell in row_data]
-                    self.model.appendRow(row_items)
-            except StopIteration:
-                pass
-            except Exception:
-                pass
-        
-        self.table_view.horizontalHeader().setStretchLastSection(True)
-        self.table_view.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+
+            reader = csv.reader(io.StringIO(content), delimiter=self.delimiter)
+            headers = next(reader, [])
+            for row_data in reader:
+                if len(rows) >= _TABLE_ROW_LIMIT:
+                    truncated = True; break
+                rows.append(row_data)
+        except Exception:
+            pass
+
+        self._sig_loaded.emit(headers, rows, truncated)
+
+    def _apply_data(self, headers, rows, truncated):
+        """Runs on the main thread via signal; populates the view."""
+        self._headers = headers
+        self._all_rows = rows
+        self._table_model = _FastTableModel(headers, rows)
+        self.table_view.setModel(self._table_model)
+        n = len(rows)
+        suffix = f" (first {_TABLE_ROW_LIMIT:,} shown)" if truncated else ""
+        self.lbl_rows.setText(f"{n:,} rows{suffix}")
+
+    def _filter_table(self, text):
+        self._filter_text = text.lower()
+        if not text:
+            filtered = self._all_rows
+        else:
+            filtered = [r for r in self._all_rows if any(text in str(c).lower() for c in r)]
+        self._table_model = _FastTableModel(self._headers, filtered)
+        self.table_view.setModel(self._table_model)
+        self.lbl_rows.setText(f"{len(filtered):,} / {len(self._all_rows):,} rows")
 
     def keyPressEvent(self, event):
         if event.modifiers() & Qt.KeyboardModifier.ControlModifier and event.key() == Qt.Key.Key_C:
@@ -373,38 +453,27 @@ class TableViewerDialog(QDialog):
     def copy_selection(self):
         selection = self.table_view.selectionModel().selectedIndexes()
         if not selection: return
-        
-        rows = sorted(list(set(index.row() for index in selection)))
-        columns = sorted(list(set(index.column() for index in selection)))
-        
-        clipboard_string = ""
-        for row in rows:
-            row_data = []
-            for col in columns:
-                idx = self.proxy_model.index(row, col)
-                if idx in selection:
-                    row_data.append(str(idx.data()))
-                else:
-                    row_data.append("")
-            clipboard_string += "\t".join(row_data) + "\n"
-            
-        QApplication.clipboard().setText(clipboard_string)
+        rows = sorted(set(i.row() for i in selection))
+        cols = sorted(set(i.column() for i in selection))
+        sel_set = {(i.row(), i.column()) for i in selection}
+        lines = []
+        for r in rows:
+            lines.append("\t".join(
+                str(self._table_model.data(self._table_model.index(r, c))) if (r, c) in sel_set else ""
+                for c in cols))
+        QApplication.clipboard().setText("\n".join(lines))
 
     def filter_table(self, text):
-        self.proxy_model.setFilterFixedString(text)
+        self._filter_table(text)
 
     def save_table(self):
         mode = 'w'
         try:
+            rows = self._all_rows
+            headers = self._headers
             if self.filename.lower().endswith('.xlsx'):
                 if not HAS_PANDAS: return
-                data = []
-                for row in range(self.model.rowCount()):
-                    row_data = []
-                    for col in range(self.model.columnCount()):
-                        item = self.model.item(row, col)
-                        row_data.append(item.text() if item else "")
-                df = pd.DataFrame(data, columns=[self.model.horizontalHeaderItem(i).text() for i in range(self.model.columnCount())])
+                df = pd.DataFrame(rows, columns=headers)
                 output = io.BytesIO()
                 df.to_excel(output, index=False)
                 new_content = output.getvalue()
@@ -412,14 +481,8 @@ class TableViewerDialog(QDialog):
             else:
                 output = io.StringIO()
                 writer = csv.writer(output, delimiter=self.delimiter)
-                headers = [self.model.horizontalHeaderItem(i).text() for i in range(self.model.columnCount())]
                 writer.writerow(headers)
-                for row in range(self.model.rowCount()):
-                    row_data = []
-                    for col in range(self.model.columnCount()):
-                        item = self.model.item(row, col)
-                        row_data.append(item.text() if item else "")
-                    writer.writerow(row_data)
+                writer.writerows(rows)
                 new_content = output.getvalue()
 
             try:
@@ -760,7 +823,6 @@ class EnvManagerDialog(QDialog):
         self.parent_ui.send_command()
         self.accept()
 
-
 class AdvancedSearchDialog(QDialog):
     def __init__(self, parent):
         super().__init__(parent)
@@ -787,7 +849,6 @@ class AdvancedSearchDialog(QDialog):
         self.input_content.setPlaceholderText("Conteúdo dentro do arquivo (Grep)")
         
         btn_search = QPushButton("Buscar" if self.lang != "en" else "Search")
-        btn_search.setStyleSheet("background-color: #007bff; color: white;")
         btn_search.clicked.connect(self.run_search)
         
         form_layout.addWidget(QLabel("Dir:"))
@@ -818,11 +879,11 @@ class AdvancedSearchDialog(QDialog):
             
         cmd = ""
         if content:
-            # Usa o grep recursivo para achar o texto dentro de arquivos
+
             safe_content = content.replace("'", "'\\''")
             cmd = f"grep -rn '{safe_content}' \"{search_dir}\" | head -n 100"
         else:
-            # Usa o find para achar o arquivo pelo nome
+
             safe_name = name.replace("'", "'\\''")
             cmd = f"find \"{search_dir}\" -type f -iname '*{safe_name}*' | head -n 100"
             
@@ -851,7 +912,7 @@ class AdvancedSearchDialog(QDialog):
             
         for line in lines:
             parts = line.split(":", 1)
-            # Se usou Grep, ele retorna /caminho/do/arquivo:Linha_do_codigo
+
             if len(parts) == 2 and self.input_content.text().strip():
                 item = QTreeWidgetItem([parts[0], parts[1].strip()])
             else:
@@ -863,11 +924,183 @@ class AdvancedSearchDialog(QDialog):
         if not path or path.startswith("Buscando") or path.startswith("Erro") or path.startswith("Nenhum"):
             return
             
-        # Ao clicar duas vezes no resultado, o File Explorer principal viaja para a pasta do arquivo
+
         target_dir = posixpath.dirname(path)
         if target_dir:
             self.parent_ui.remote_path = target_dir
             self.parent_ui.cmd_input.setText(f"cd \"{target_dir}\"")
             self.parent_ui.send_command()
-        
+
         self.close()
+
+class LocalFileExplorerDialog(QDialog):
+    """Explorador de arquivos local com suporte a arrastar arquivos para o explorador remoto."""
+
+    def __init__(self, parent=None, lang="en"):
+        super().__init__(parent)
+        self.lang = lang
+        self._history = []
+        self._history_idx = -1
+
+        self.setWindowTitle(t("local_explorer_title", lang))
+        self.setMinimumSize(520, 640)
+        self.setWindowFlags(
+            Qt.WindowType.Window |
+            Qt.WindowType.WindowMinimizeButtonHint |
+            Qt.WindowType.WindowMaximizeButtonHint |
+            Qt.WindowType.WindowCloseButtonHint
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
+
+        root_layout = QVBoxLayout(self)
+        root_layout.setContentsMargins(8, 8, 8, 8)
+        root_layout.setSpacing(6)
+
+        self.lbl_hint = QLabel()
+        self.lbl_hint.setWordWrap(True)
+        self.lbl_hint.setStyleSheet(
+            "padding: 7px 10px; border-radius: 6px;"
+            "background: rgba(128,128,128,0.15); font-size: 12px;"
+        )
+        root_layout.addWidget(self.lbl_hint)
+
+        nav = QHBoxLayout()
+        nav.setSpacing(4)
+
+        self.btn_home = QPushButton()
+        self.btn_home.setFixedWidth(34)
+        self.btn_home.clicked.connect(self.go_home)
+
+        self.btn_back = QPushButton()
+        self.btn_back.setFixedWidth(34)
+        self.btn_back.setEnabled(False)
+        self.btn_back.clicked.connect(self.go_back)
+
+        self.btn_up = QPushButton()
+        self.btn_up.setFixedWidth(34)
+        self.btn_up.clicked.connect(self.go_up)
+
+        self.path_input = QLineEdit()
+        self.path_input.returnPressed.connect(self._navigate_typed)
+
+        nav.addWidget(self.btn_home)
+        nav.addWidget(self.btn_back)
+        nav.addWidget(self.btn_up)
+        nav.addWidget(self.path_input)
+        root_layout.addLayout(nav)
+
+        self.fs_model = QFileSystemModel(self)
+        self.fs_model.setRootPath(QDir.rootPath())
+
+        self.tree = QTreeView()
+        self.tree.setModel(self.fs_model)
+        self.tree.setDragEnabled(True)
+        self.tree.setSelectionMode(QTreeView.SelectionMode.ExtendedSelection)
+        self.tree.setDragDropMode(QTreeView.DragDropMode.DragOnly)
+        self.tree.setDefaultDropAction(Qt.DropAction.CopyAction)
+        self.tree.setAnimated(True)
+        self.tree.setSortingEnabled(True)
+        self.tree.setAlternatingRowColors(True)
+        self.tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.tree.header().resizeSection(1, 80)
+        self.tree.header().resizeSection(2, 90)
+        self.tree.header().resizeSection(3, 120)
+        self.tree.doubleClicked.connect(self._on_double_click)
+        root_layout.addWidget(self.tree)
+
+        self.btn_send = QPushButton()
+        self.btn_send.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.btn_send.clicked.connect(self._send_selected)
+        root_layout.addWidget(self.btn_send)
+
+        self._navigate_to(QDir.homePath(), add_history=True)
+        self.update_lang(lang)
+
+        if parent and hasattr(parent, 'get_stylesheet'):
+            self.setStyleSheet(parent.get_stylesheet())
+
+    def _navigate_to(self, path, add_history=True):
+        if not QDir(path).exists():
+            return
+        idx = self.fs_model.index(path)
+        self.tree.setRootIndex(idx)
+        self.path_input.setText(path)
+        if add_history:
+            self._history = self._history[:self._history_idx + 1]
+            self._history.append(path)
+            self._history_idx = len(self._history) - 1
+        self.btn_back.setEnabled(self._history_idx > 0)
+
+    def go_home(self):
+        self._navigate_to(QDir.homePath())
+
+    def go_back(self):
+        if self._history_idx > 0:
+            self._history_idx -= 1
+            self._navigate_to(self._history[self._history_idx], add_history=False)
+            self.btn_back.setEnabled(self._history_idx > 0)
+
+    def go_up(self):
+        current = self._history[self._history_idx] if self._history else QDir.homePath()
+        parent_dir = QDir(current)
+        if parent_dir.cdUp():
+            self._navigate_to(parent_dir.absolutePath())
+
+    def _navigate_typed(self):
+        path = self.path_input.text().strip()
+        if QDir(path).exists():
+            self._navigate_to(path)
+
+    def _on_double_click(self, index):
+        path = self.fs_model.filePath(index)
+        if os.path.isdir(path):
+            self._navigate_to(path)
+
+    def _send_selected(self):
+        parent_ui = self.parent()
+        if not parent_ui or not hasattr(parent_ui, 'on_drop_files'):
+            return
+        indexes = self.tree.selectedIndexes()
+        seen = set()
+        paths = []
+        for idx in indexes:
+            if idx.column() != 0:
+                continue
+            p = self.fs_model.filePath(idx)
+            if p not in seen:
+                seen.add(p)
+                paths.append(p)
+        if paths:
+            parent_ui.on_drop_files(paths)
+
+    def update_lang(self, lang):
+        import qtawesome as qta
+        self.lang = lang
+        self.setWindowTitle(t("local_explorer_title", lang))
+        self.lbl_hint.setText(t("local_explorer_hint", lang))
+        self.path_input.setPlaceholderText(t("local_path_placeholder", lang))
+        self.btn_home.setToolTip(t("tip_home", lang))
+        self.btn_back.setToolTip(t("tip_back", lang))
+        self.btn_up.setToolTip(t("tip_go_up", lang))
+        self.btn_home.setIcon(qta.icon('fa5s.home',       color='white'))
+        self.btn_back.setIcon(qta.icon('fa5s.arrow-left', color='white'))
+        self.btn_up.setIcon(  qta.icon('fa5s.level-up-alt', color='white'))
+        self.btn_send.setIcon(qta.icon('fa5s.upload',     color='white'))
+        self.btn_send.setText(f"  {t('local_send_btn', lang)}")
+
+    def refresh_theme(self):
+        parent_ui = self.parent()
+        if parent_ui and hasattr(parent_ui, 'get_stylesheet'):
+            self.setStyleSheet(parent_ui.get_stylesheet())
+        if parent_ui and hasattr(parent_ui, 'config_mgr'):
+            accent = parent_ui.config_mgr.theme.get('accent', '#bd93f9')
+            try:
+                r = int(accent[1:3], 16)
+                g = int(accent[3:5], 16)
+                b = int(accent[5:7], 16)
+                self.lbl_hint.setStyleSheet(
+                    f"padding: 7px 10px; border-radius: 6px; font-size: 12px; "
+                    f"background: rgba({r},{g},{b},0.15);"
+                )
+            except Exception:
+                pass
