@@ -16,5 +16,13 @@ if __name__ == "__main__":
     app.setStyle("Fusion") 
     app.setWindowIcon(QIcon(resource_path("Nix.jpg"))) 
     window = Interface()
-    window.show()
+    screen = app.primaryScreen()
+    if screen:
+        available = screen.availableGeometry()
+        if available.width() < 1300 or available.height() < 850:
+            window.showMaximized()
+        else:
+            window.show()
+    else:
+        window.show()
     sys.exit(app.exec())
