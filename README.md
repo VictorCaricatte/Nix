@@ -25,7 +25,7 @@ Nix is a desktop application that brings a clean, visual interface to managing L
 
 A ready-to-use Windows executable is available — no Python installation required.
 
-**[→ Download Nix.exe](https://github.com/VictorCaricatte/Nix/releases/download/Nix/Nix.exe)**
+**[→ Download Nix.exe](https://github.com/VictorCaricatte/Nix/releases/download/v1.2.1/Nix_Windows.exe)**
 
 Just download, run, and connect.
 
@@ -142,7 +142,7 @@ Toggle with the **Layout** button or `Ctrl` shortcut.
 
 ### Option 1 — Executable (recommended)
 
-1. Download **[Nix.exe](https://github.com/VictorCaricatte/Nix/releases/download/Nix/Nix.exe)**
+1. Download **[Nix.exe](https://github.com/VictorCaricatte/Nix/releases/download/v1.2.1/Nix_Windows.exe)**
 2. Run it — no installation needed
 3. Enter `user@host`, provide a password or SSH key, and click **Connect**
 
