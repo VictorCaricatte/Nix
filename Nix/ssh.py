@@ -1,4 +1,3 @@
-import paramiko
 import threading
 import socket
 import os
@@ -78,6 +77,7 @@ class SSHManager:
         threading.Thread(target=handle_connection, daemon=True).start()
 
     def connect(self, host, username, password=None, key_filename=None, use_x11=False):
+        import paramiko
         self.client = paramiko.SSHClient()
         self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
@@ -114,20 +114,21 @@ class SSHManager:
         self.is_connected = True
 
     def switch_sftp_user(self, target_user, sudo_password):
+        import paramiko
         check_cmd = f"sudo -n -u {target_user} true" if target_user != "root" else "sudo -n true"
         _, stdout, _ = self.client.exec_command(check_cmd)
         exit_status = stdout.channel.recv_exit_status()
-        
+
         channel = self.client.get_transport().open_session()
         sftp_paths = "/usr/lib/openssh/sftp-server /usr/libexec/openssh/sftp-server /usr/lib/sftp-server /usr/libexec/sftp-server"
         find_cmd = f"for p in {sftp_paths}; do if [ -x $p ]; then exec $p; fi; done"
-        
+
         cmd = f"sudo -S -p '' -u {target_user} sh -c '{find_cmd}'" if target_user != "root" else f"sudo -S -p '' sh -c '{find_cmd}'"
         channel.exec_command(cmd)
-        
+
         if exit_status != 0 and sudo_password:
             channel.sendall(sudo_password + "\n")
-        
+
         try:
             new_sftp = paramiko.SFTPClient(channel)
             with self.lock:

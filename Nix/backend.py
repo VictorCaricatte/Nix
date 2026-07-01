@@ -110,10 +110,14 @@ def parse_monitor_output(output):
     for l in user_lines:
         parts = l.split()
         if len(parts) >= 1:
-            user_str = parts[0]
-            if len(parts) > 1:
-                user_str += f" ({parts[1]})"
-            users.append(user_str)
+            user = parts[0]
+            tty = parts[1] if len(parts) > 1 else ""
+            # `who` mostra a origem da conexão (IP/host) entre parênteses no fim
+            # da linha para logins remotos; logins locais não têm esse campo.
+            origin = ""
+            if "(" in l and ")" in l:
+                origin = l[l.rfind("(") + 1: l.rfind(")")].strip()
+            users.append({"user": user, "tty": tty, "origin": origin})
             
 
     for l in proc_lines:

@@ -21,7 +21,6 @@ from config import ConfigManager, encrypt_password, decrypt_password
 from i18n import t
 from dialogs import LocalFileExplorerDialog
 from tab_panel import ConnectionTab
-from devops_dialogs import FleetDashboardWidget, BatchExecDialog
 
 def resource_path(relative_path):
     try:
@@ -43,20 +42,22 @@ class Interface(QMainWindow):
         self.config_mgr = ConfigManager()
         self.terminal_font_size = self.config_mgr.theme.get("font_size", 13)
         self._local_explorer = None
+        self._fleet_widget = None
 
         self.create_core_widgets()
         self._setup_tray()
         self.apply_layout()
-        self._add_fleet_tab()
         self.add_tab()
         self.update_ui_texts()
         self._setup_shortcuts()
+        QTimer.singleShot(0, self._add_fleet_tab)
 
     def _add_fleet_tab(self):
+        from devops_dialogs import FleetDashboardWidget
         fleet = FleetDashboardWidget(self, self.config_mgr, self._on_fleet_connect)
         self._fleet_widget = fleet
         lang = self.config_mgr.language
-        idx = self.tab_widget.addTab(fleet, f" {t('fleet_tab', lang)}")
+        idx = self.tab_widget.insertTab(0, fleet, f" {t('fleet_tab', lang)}")
         self.tab_widget.tabBar().setTabIcon(idx, qta.icon('fa5s.satellite-dish', color='white'))
 
     def _on_fleet_connect(self, session_name):
@@ -81,6 +82,7 @@ class Interface(QMainWindow):
             QMessageBox.information(self, t("batch_exec", lang),
                                     t("no_connected_sessions", lang))
             return
+        from devops_dialogs import BatchExecDialog
         BatchExecDialog(self, connected).exec()
 
     def _menu_icon_color(self):
@@ -108,12 +110,13 @@ class Interface(QMainWindow):
             self.btn_settings_menu.rect().bottomLeft()))
 
     def _open_fleet_tab(self):
-        for i in range(self.tab_widget.count()):
-            if isinstance(self.tab_widget.widget(i), FleetDashboardWidget):
-                self.tab_widget.setCurrentIndex(i)
+        if self._fleet_widget is not None:
+            idx = self.tab_widget.indexOf(self._fleet_widget)
+            if idx >= 0:
+                self.tab_widget.setCurrentIndex(idx)
                 return
         self._add_fleet_tab()
-        self.tab_widget.setCurrentIndex(self.tab_widget.count() - 1)
+        self.tab_widget.setCurrentIndex(self.tab_widget.indexOf(self._fleet_widget))
 
     def _show_tools_menu(self):
         lang = self.config_mgr.language
@@ -459,18 +462,24 @@ class Interface(QMainWindow):
         thm = self.config_mgr.theme
         mode       = thm.get("mode", "dark")
         accent     = thm.get("accent", "#bd93f9")
-        term_color = thm.get("terminal_color", "#a6accd")
         base_bg    = thm.get("bg_color", "#151015")
         term_style = thm.get("term_style", "standard")
+
+        _DEFAULT_DARK_TERM_COLOR = "#a6accd"
 
         if mode == "dark":
             bg = base_bg; card = "#1e161e"; fg = "#f8f8f2"; term_bg = "#0d0a0d"
             border = "transparent"; input_border = "#444"
             btn_dis_bg = "#444444"; btn_dis_fg = "#888888"; hover_fg = bg
+            divider_color = "#555555"
+            term_color = thm.get("terminal_color", _DEFAULT_DARK_TERM_COLOR)
         else:
-            bg = "#f0f2f6"; card = "#ffffff"; fg = "#000000"; term_bg = "#ffffff"
+            bg = "#f0f2f6"; card = "#ffffff"; fg = "#000000"; term_bg = "#f5f5f5"
             border = "#cccccc"; input_border = "#cccccc"
             btn_dis_bg = "#cccccc"; btn_dis_fg = "#888888"; hover_fg = "#ffffff"
+            divider_color = "#d0d0d0"
+            stored_tc = thm.get("terminal_color", _DEFAULT_DARK_TERM_COLOR)
+            term_color = "#2d3436" if stored_tc == _DEFAULT_DARK_TERM_COLOR else stored_tc
 
         if term_style == "matrix":
             term_font = "'Courier New', monospace"; term_weight = "bold"; term_bg_eff = "#000000"
@@ -512,6 +521,7 @@ class Interface(QMainWindow):
         QTabBar::tab {{ background: {bg}; color: {fg}; padding: 8px 16px; border: 1px solid {border}; border-top-left-radius: 4px; border-top-right-radius: 4px; }}
         QTabBar::tab:selected {{ background: {card}; color: {accent}; font-weight: bold; }}
         QTextEdit, QPlainTextEdit {{ background-color: {term_bg_eff}; color: {term_color}; border: 1px solid {border}; border-radius: 8px; padding: 10px; font-family: {term_font}; font-size: {fs}px; font-weight: {term_weight}; }}
+        QTextEdit#OSInfoText {{ background-color: {term_bg_eff}; color: {term_color}; border: 1px solid {border}; border-radius: 8px; padding: 10px; font-family: 'Consolas', monospace; font-size: 12px; font-weight: normal; }}
         QScrollBar:vertical {{ background-color: {bg}; width: 12px; border-radius: 6px; }}
         QScrollBar::handle:vertical {{ background-color: {accent}; min-height: 20px; border-radius: 6px; margin: 2px; }}
         QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0px; }}
@@ -519,8 +529,13 @@ class Interface(QMainWindow):
         QScrollBar::handle:horizontal {{ background-color: {accent}; min-width: 20px; border-radius: 3px; margin: 1px; }}
         QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width: 0px; }}
         QScrollArea#ConnScrollArea {{ background-color: transparent; border: none; }}
+        QScrollArea#TransferScroll {{ background-color: {card}; border: none; }}
+        QScrollArea#TransferScroll > QWidget {{ background-color: {card}; }}
+        QWidget#TransferList {{ background-color: {card}; }}
         QLabel#Title {{ font-size: 15px; font-weight: bold; color: {accent}; }}
+        QLabel#PromptLabel {{ color: {accent}; font-weight: bold; font-size: 16px; }}
         QLabel#MonitorValue {{ font-size: 26px; font-weight: bold; color: {fg}; }}
+        QFrame#MonitorDivider {{ background-color: {divider_color}; max-height: 1px; border: none; }}
         QProgressBar {{ background-color: {bg}; border-radius: 4px; text-align: center; color: transparent; border: 1px solid {border}; }}
         QProgressBar::chunk {{ background-color: {accent}; border-radius: 4px; }}
         QMenu {{ background-color: {card}; border-radius: 6px; padding: 5px; border: 1px solid {border}; }}
@@ -532,6 +547,10 @@ class Interface(QMainWindow):
         self.setStyleSheet(self.get_stylesheet())
         if self._local_explorer:
             self._local_explorer.refresh_theme()
+        for i in range(self.tab_widget.count()):
+            w = self.tab_widget.widget(i)
+            if isinstance(w, ConnectionTab):
+                w.refresh_transfer_panel_theme()
 
     def toggle_theme_mode(self):
         self.config_mgr.theme["mode"] = "light" if self.config_mgr.theme.get("mode") == "dark" else "dark"

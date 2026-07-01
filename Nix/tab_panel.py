@@ -17,7 +17,7 @@ from PyQt6.QtWidgets import (
     QSplitter, QFrame, QLabel, QLineEdit, QPushButton, QTreeWidget,
     QTreeWidgetItem, QPlainTextEdit, QProgressBar, QSizePolicy,
     QFileDialog, QInputDialog, QMessageBox, QMenu, QTabWidget,
-    QTextEdit, QListWidget, QScrollArea, QComboBox,
+    QTextEdit, QListWidget, QListWidgetItem, QScrollArea, QComboBox,
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QEvent, QMimeData, QUrl
@@ -32,11 +32,6 @@ from dialogs import (
     RemoteEditorDialog, ImageViewerDialog, TextViewerDialog,
     ScreensManagerDialog, EnvManagerDialog, TableViewerDialog,
     AdvancedSearchDialog, LocalFileExplorerDialog,
-)
-from devops_dialogs import (
-    TunnelManagerDialog, CronEditorDialog, ServiceManagerDialog,
-    LogViewerDialog, SSHKeyManagerDialog, FileSyncDialog, PortMonitorDialog,
-    PackageManagerDialog, UserManagerDialog, FirewallDialog,
 )
 
 class InteractiveTerminal(QPlainTextEdit):
@@ -242,10 +237,12 @@ class ConnectionTab(QWidget):
         tp_layout.addLayout(tp_header)
 
         self._tp_scroll = QScrollArea()
+        self._tp_scroll.setObjectName("TransferScroll")
         self._tp_scroll.setWidgetResizable(True)
         self._tp_scroll.setFrameShape(QFrame.Shape.NoFrame)
         self._tp_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._tp_list_widget = QWidget()
+        self._tp_list_widget.setObjectName("TransferList")
         self._tp_list_layout = QVBoxLayout(self._tp_list_widget)
         self._tp_list_layout.setSpacing(2)
         self._tp_list_layout.setContentsMargins(0, 0, 0, 0)
@@ -292,11 +289,12 @@ class ConnectionTab(QWidget):
 
         self.output = InteractiveTerminal(self)
         self.output.setReadOnly(True)
+        self.output.setMaximumBlockCount(5000)
         term_layout.addWidget(self.output)
 
         input_layout = QHBoxLayout()
         lbl_prompt = QLabel("❯")
-        lbl_prompt.setStyleSheet("color: #89DDFF; font-weight: bold; font-size: 16px;")
+        lbl_prompt.setObjectName("PromptLabel")
         self.cmd_input = QLineEdit()
         self.cmd_input.returnPressed.connect(self.send_command)
         self.cmd_input.installEventFilter(self)
@@ -366,13 +364,13 @@ class ConnectionTab(QWidget):
         stats_layout.addLayout(net_box)
         tab_mon_layout.addLayout(stats_layout)
 
-        div = QFrame(); div.setFrameShape(QFrame.Shape.HLine); div.setStyleSheet("background-color:#444;")
+        div = QFrame(); div.setFrameShape(QFrame.Shape.HLine); div.setObjectName("MonitorDivider")
         tab_mon_layout.addWidget(div)
 
         bottom_mon = QHBoxLayout()
         users_vbox = QVBoxLayout()
         self.lbl_users = QLabel(t("active_users", lang)); self.lbl_users.setObjectName("Title")
-        self.users_list = QListWidget(); self.users_list.setFixedWidth(140)
+        self.users_list = QListWidget(); self.users_list.setMinimumWidth(180)
         self.users_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.users_list.customContextMenuRequested.connect(self.show_users_context_menu)
         users_vbox.addWidget(self.lbl_users); users_vbox.addWidget(self.users_list)
@@ -392,8 +390,8 @@ class ConnectionTab(QWidget):
         self.tab_os = QWidget()
         tab_os_layout = QVBoxLayout(self.tab_os)
         self.os_info_text = QTextEdit()
+        self.os_info_text.setObjectName("OSInfoText")
         self.os_info_text.setReadOnly(True)
-        self.os_info_text.setStyleSheet("font-family: 'Consolas', monospace; font-size: 12px;")
         tab_os_layout.addWidget(self.os_info_text)
 
         self.tab_snippets = QWidget()
@@ -549,6 +547,11 @@ class ConnectionTab(QWidget):
         if not self.ssh_mgr.is_connected:
             self.sig_msg.emit("warn", "DevOps", "Connect to a server first.")
             return
+        from devops_dialogs import (
+            TunnelManagerDialog, CronEditorDialog, ServiceManagerDialog,
+            LogViewerDialog, SSHKeyManagerDialog, FileSyncDialog, PortMonitorDialog,
+            PackageManagerDialog, UserManagerDialog, FirewallDialog,
+        )
         lang = self.config_mgr.language
         ic = self._menu_icon_color()
         menu = QMenu(self)
@@ -577,11 +580,13 @@ class ConnectionTab(QWidget):
     def _open_service_manager(self):
         if not self.ssh_mgr.is_connected:
             self.sig_msg.emit("warn", "DevOps", "Not connected."); return
+        from devops_dialogs import ServiceManagerDialog
         ServiceManagerDialog(self, self.ssh_mgr, self.config_mgr.language).exec()
 
     def _open_port_monitor(self):
         if not self.ssh_mgr.is_connected:
             self.sig_msg.emit("warn", "DevOps", "Not connected."); return
+        from devops_dialogs import PortMonitorDialog
         PortMonitorDialog(self, self.ssh_mgr, self.config_mgr.language).exec()
 
     def _on_sys_tab_changed(self, idx):
@@ -907,6 +912,7 @@ class ConnectionTab(QWidget):
                     self.sig_monitor.emit(parsed[0], parsed[1], parsed[2], {}, [], {})
                 else:
                     self.sig_monitor.emit(*parsed)
+                time.sleep(2)
             except Exception:
                 time.sleep(4)
 
@@ -985,7 +991,21 @@ class ConnectionTab(QWidget):
                                        else [p[0], "-", f"{p[1]}%", f"{p[2]}%", p[3]])
                 self.proc_tree.addTopLevelItem(item)
             self.users_list.clear()
-            for u in users: self.users_list.addItem(u)
+            for u in users:
+                if isinstance(u, dict):
+                    user = u.get("user", ""); tty = u.get("tty", ""); origin = u.get("origin", "")
+                    label = f"{user} ({tty})" if tty else user
+                    if origin:
+                        label += f"  ⇐ {origin}"
+                        tip = f"{user} @ {tty}\n{t('conn_from', lang)}: {origin}"
+                    else:
+                        tip = f"{user} @ {tty}\n{t('conn_local', lang)}"
+                    item = QListWidgetItem(label)
+                    item.setToolTip(tip)
+                    item.setData(Qt.ItemDataRole.UserRole, u)
+                    self.users_list.addItem(item)
+                else:
+                    self.users_list.addItem(u)
         except Exception:
             pass
 
@@ -1096,6 +1116,10 @@ class ConnectionTab(QWidget):
 
         if not self.command_history or self.command_history[0] != cmd:
             self.command_history.insert(0, cmd)
+            # Mantém o histórico limitado na memória: sem isso a lista cresce
+            # sem parar e o Nix fica lento após muitos comandos.
+            if len(self.command_history) > 500:
+                del self.command_history[500:]
             self._save_command_history()
         self.history_index = -1
 
@@ -1126,7 +1150,10 @@ class ConnectionTab(QWidget):
 
     def _save_command_history(self):
         self.config_mgr.command_history = self.command_history[:500]
-        self.config_mgr.save_config()
+        now = time.time()
+        if now - getattr(self, '_last_history_save', 0) > 10:
+            self.config_mgr.save_config()
+            self._last_history_save = now
 
     def process_comand_nano(self, cmd):
         use_sudo = "sudo" in cmd
@@ -1318,9 +1345,15 @@ class ConnectionTab(QWidget):
             size /= 1024.0
         return f"{size:.1f} TB"
 
+    _QTA_ICON_CACHE: dict = {}
+
     def get_file_icon(self, filename, is_dir=False):
         try:
-            if is_dir: return qta.icon('fa5s.folder', color='#eccb5b')
+            if is_dir:
+                key = 'dir:#eccb5b'
+                if key not in self._QTA_ICON_CACHE:
+                    self._QTA_ICON_CACHE[key] = qta.icon('fa5s.folder', color='#eccb5b')
+                return self._QTA_ICON_CACHE[key]
             ext = os.path.splitext(filename)[1].lower()
             icons = {
                 '.py': ('fa5b.python', '#3776AB'), '.pyc': ('fa5b.python', '#3776AB'),
@@ -1361,10 +1394,16 @@ class ConnectionTab(QWidget):
                 '.exe': ('fa5b.windows', '#000000'), '.iso': ('fa5s.compact-disc', '#000000'),
             }
             icon_name, color = icons.get(ext, ('fa5s.file', '#A9A9A9'))
-            if self.config_mgr.theme.get("mode") == "dark" and color == '#000000': color = '#FFFFFF'
-            return qta.icon(icon_name, color=color)
+            mode = self.config_mgr.theme.get("mode", "dark")
+            effective_color = '#FFFFFF' if (mode == "dark" and color == '#000000') else color
+            cache_key = f'{icon_name}:{effective_color}'
+            if cache_key not in self._QTA_ICON_CACHE:
+                self._QTA_ICON_CACHE[cache_key] = qta.icon(icon_name, color=effective_color)
+            return self._QTA_ICON_CACHE[cache_key]
         except Exception:
-            return qta.icon('fa5s.file', color='#A9A9A9')
+            if 'default' not in self._QTA_ICON_CACHE:
+                self._QTA_ICON_CACHE['default'] = qta.icon('fa5s.file', color='#A9A9A9')
+            return self._QTA_ICON_CACHE['default']
 
     def show_context_menu(self, pos):
         if not self.ssh_mgr.is_connected: return
@@ -1563,23 +1602,34 @@ class ConnectionTab(QWidget):
                 pwd, ok = QInputDialog.getText(self, "Sudo", t("enter_sudo", lang), QLineEdit.EchoMode.Password)
                 if not ok: return
                 self.sudo_cache[0] = pwd
-            try:
-                stdin, _, stderr = self.ssh_mgr.execute(f"sudo -S kill {sig} {pid}")
-                stdin.write(self.sudo_cache[0] + "\n"); stdin.flush()
-                err = stderr.read().decode().strip()
-                if "incorrect" in err.lower() or "wrong password" in err.lower():
-                    self.sudo_cache[0] = None
-                    self.sig_msg.emit("warn", "Sudo", "Senha sudo incorreta.")
-                else:
-                    self.sig_log.emit(f"[sudo kill {sig} {pid}]")
-            except Exception as e:
-                self.sig_log.emit(f"{t('error_kill', lang)} {e}")
+            threading.Thread(target=self._kill_process_sudo, args=(pid, sig), daemon=True).start()
         else:
-            try:
-                self.ssh_mgr.execute(f"kill {sig} {pid}")
-                self.sig_log.emit(f"[kill {sig} {pid}]")
-            except Exception as e:
-                self.sig_log.emit(f"{t('error_kill', lang)} {e}")
+            threading.Thread(target=self._kill_process_plain, args=(pid, sig), daemon=True).start()
+
+    def _kill_process_plain(self, pid, sig):
+        """Executa o kill sem sudo numa thread para não travar a GUI."""
+        lang = self.config_mgr.language
+        try:
+            _, stdout, _ = self.ssh_mgr.execute(f"kill {sig} {pid}")
+            stdout.channel.recv_exit_status()  # espera o comando terminar
+            self.sig_log.emit(f"[kill {sig} {pid}]")
+        except Exception as e:
+            self.sig_log.emit(f"{t('error_kill', lang)} {e}")
+
+    def _kill_process_sudo(self, pid, sig):
+        """Executa o kill via sudo numa thread para não travar a GUI."""
+        lang = self.config_mgr.language
+        try:
+            stdin, _, stderr = self.ssh_mgr.execute(f"sudo -S kill {sig} {pid}")
+            stdin.write(self.sudo_cache[0] + "\n"); stdin.flush()
+            err = stderr.read().decode().strip()
+            if "incorrect" in err.lower() or "wrong password" in err.lower():
+                self.sudo_cache[0] = None
+                self.sig_msg.emit("warn", "Sudo", "Senha sudo incorreta.")
+            else:
+                self.sig_log.emit(f"[sudo kill {sig} {pid}]")
+        except Exception as e:
+            self.sig_log.emit(f"{t('error_kill', lang)} {e}")
 
     def show_users_context_menu(self, pos):
         item = self.users_list.itemAt(pos)
@@ -1589,9 +1639,14 @@ class ConnectionTab(QWidget):
             QMessageBox.information(self, "Permissão negada",
                                     "Apenas usuários com sudo ou root podem desconectar sessões.")
             return
-        user_info = item.text()
-        user_name = user_info.split()[0]
-        tty = user_info.split("(")[1].strip(")") if "(" in user_info else ""
+        data = item.data(Qt.ItemDataRole.UserRole)
+        if isinstance(data, dict):
+            user_name = data.get("user", "")
+            tty = data.get("tty", "")
+        else:
+            user_info = item.text()
+            user_name = user_info.split()[0]
+            tty = user_info.split("(")[1].split(")")[0] if "(" in user_info else ""
         lang = self.config_mgr.language
         menu = QMenu(self)
         a = QAction(qta.icon('fa5s.user-slash', color='red'), f"{t('disconnect', lang)} {user_name}", self)
@@ -1615,6 +1670,10 @@ class ConnectionTab(QWidget):
             self.sudo_cache[0] = pwd
         cmd = (f"sudo -S pkill -9 -t {tty.replace('/dev/', '')}"
                if tty else f"sudo -S pkill -9 -u {user}")
+        threading.Thread(target=self._kill_user_session_worker, args=(cmd, user), daemon=True).start()
+
+    def _kill_user_session_worker(self, cmd, user):
+        """Desconecta a sessão via sudo numa thread para não travar a GUI."""
         try:
             stdin, _, stderr = self.ssh_mgr.execute(cmd)
             stdin.write(self.sudo_cache[0] + "\n"); stdin.flush()
@@ -1678,6 +1737,12 @@ class ConnectionTab(QWidget):
 
     def _force_hide_transfer_panel(self):
         self.transfer_panel.setVisible(False)
+
+    def refresh_transfer_panel_theme(self):
+        mode = self.config_mgr.theme.get("mode", "dark")
+        card = "#ffffff" if mode == "light" else "#1e161e"
+        self._tp_scroll.setStyleSheet(f"background: {card}; border: none;")
+        self._tp_scroll.viewport().setStyleSheet(f"background: {card};")
 
     def sftp_progress_callback(self, transferred, total, transfer_id):
         now = time.time()
