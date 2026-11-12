@@ -10,13 +10,21 @@ from PyQt6.QtWidgets import (
     QTreeWidgetItem,
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QThread
+from widgets import gui_single_shot
 from PyQt6.QtGui import QColor, QFont, QTextCharFormat, QTextCursor, QBrush
 
 import qtawesome as qta
 from i18n import t
+from backend import sh_quote
 
 class TunnelManagerDialog(QDialog):
     """Visual SSH tunnel manager — local, remote and dynamic (SOCKS5)."""
+
+    # Teto de conexões simultâneas encaminhadas por túnel. Cada conexão gera
+    # threads + um canal SSH; sem limite, um cliente abusivo (ou um app com
+    # bug) poderia esgotar threads/descritores do Nix. Ao atingir o teto,
+    # novas conexões são recusadas até liberar espaço.
+    MAX_CONNS_PER_TUNNEL = 100
 
     def __init__(self, parent, ssh_mgr, lang="en"):
         super().__init__(parent)
@@ -38,12 +46,24 @@ class TunnelManagerDialog(QDialog):
         self.inp_remote_host = QLineEdit(); self.inp_remote_host.setPlaceholderText("Remote host (e.g. 127.0.0.1)"); self.inp_remote_host.setFixedWidth(160)
         self.inp_remote_port = QLineEdit(); self.inp_remote_port.setPlaceholderText("Remote port"); self.inp_remote_port.setFixedWidth(100)
 
+        # Túnel reverso ("Remote"): por padrão o bind no servidor fica em
+        # 127.0.0.1 (só acessível localmente no servidor). Marcar isto pede
+        # bind em 0.0.0.0, expondo a porta encaminhada para toda a rede — só
+        # funciona se o sshd tiver GatewayPorts habilitado, e é um risco de
+        # segurança, então fica desligado e explícito.
+        self.chk_public = QCheckBox("Expose publicly (0.0.0.0)")
+        self.chk_public.setToolTip(
+            "Only for Remote tunnels. Off = bind to 127.0.0.1 on the server "
+            "(safe). On = bind to all interfaces (exposes the port to the "
+            "network; requires sshd GatewayPorts).")
+
         btn_add = QPushButton("Add Tunnel")
         btn_add.setIcon(qta.icon('fa5s.plus', color='white'))
         btn_add.clicked.connect(self._add_tunnel)
 
         for w in [QLabel("Type:"), self.combo_type, QLabel("Local port:"), self.inp_local_port,
-                  QLabel("→ Remote:"), self.inp_remote_host, QLabel(":"), self.inp_remote_port, btn_add]:
+                  QLabel("→ Remote:"), self.inp_remote_host, QLabel(":"), self.inp_remote_port,
+                  self.chk_public, btn_add]:
             form.addWidget(w)
         layout.addLayout(form)
 
@@ -93,7 +113,14 @@ class TunnelManagerDialog(QDialog):
             "Remote":           self._run_remote_tunnel,
             "Dynamic (SOCKS5)": self._run_socks5_tunnel,
         }[ttype]
-        args = (local_port, remote_host, remote_port, stop_ev) if ttype != "Dynamic (SOCKS5)" else (local_port, stop_ev)
+        if ttype == "Remote":
+            # bind loopback por padrão; só 0.0.0.0 se o usuário optar explicitamente
+            bind_addr = "" if self.chk_public.isChecked() else "127.0.0.1"
+            args = (local_port, remote_host, remote_port, stop_ev, bind_addr)
+        elif ttype == "Local":
+            args = (local_port, remote_host, remote_port, stop_ev)
+        else:
+            args = (local_port, stop_ev)
         t_thread = threading.Thread(target=target_fn, args=args, daemon=True)
 
         row = self.tbl.rowCount()
@@ -107,7 +134,7 @@ class TunnelManagerDialog(QDialog):
 
         self._tunnels[tid] = {'stop': stop_ev, 'thread': t_thread, 'status_item': status_item}
         t_thread.start()
-        QTimer.singleShot(600, lambda: self._check_status(tid))
+        gui_single_shot(600, lambda: self._check_status(tid))
 
     def _check_status(self, tid):
         info = self._tunnels.get(tid)
@@ -120,6 +147,7 @@ class TunnelManagerDialog(QDialog):
             info['status_item'].setForeground(QBrush(QColor("#dc3545")))
 
     def _run_local_tunnel(self, local_port, remote_host, remote_port, stop_ev):
+        sem = threading.BoundedSemaphore(self.MAX_CONNS_PER_TUNNEL)
         try:
             srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -129,20 +157,24 @@ class TunnelManagerDialog(QDialog):
                     client_sock, _ = srv.accept()
                 except socket.timeout:
                     continue
+                if not sem.acquire(blocking=False):
+                    client_sock.close()  # teto de conexões atingido
+                    continue
                 try:
                     ch = self.ssh_mgr.client.get_transport().open_channel(
                         'direct-tcpip', (remote_host, remote_port), ('127.0.0.1', local_port))
-                    threading.Thread(target=self._fwd2, args=(client_sock, ch), daemon=True).start()
+                    threading.Thread(target=self._fwd2, args=(client_sock, ch, sem), daemon=True).start()
                 except Exception:
+                    sem.release()
                     client_sock.close()
             srv.close()
         except Exception:
             pass
 
-    def _run_remote_tunnel(self, local_port, remote_host, remote_port, stop_ev):
+    def _run_remote_tunnel(self, local_port, remote_host, remote_port, stop_ev, bind_addr="127.0.0.1"):
         try:
             transport = self.ssh_mgr.client.get_transport()
-            transport.request_port_forward('', remote_port)
+            transport.request_port_forward(bind_addr, remote_port)
             while not stop_ev.is_set():
                 ch = transport.accept(1.0)
                 if ch is None: continue
@@ -151,11 +183,12 @@ class TunnelManagerDialog(QDialog):
                     threading.Thread(target=self._fwd2, args=(ch, local_sock), daemon=True).start()
                 except Exception:
                     ch.close()
-            transport.cancel_port_forward('', remote_port)
+            transport.cancel_port_forward(bind_addr, remote_port)
         except Exception:
             pass
 
     def _run_socks5_tunnel(self, local_port, stop_ev):
+        sem = threading.BoundedSemaphore(self.MAX_CONNS_PER_TUNNEL)
         try:
             srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -165,12 +198,19 @@ class TunnelManagerDialog(QDialog):
                     client_sock, _ = srv.accept()
                 except socket.timeout:
                     continue
-                threading.Thread(target=self._handle_socks5, args=(client_sock,), daemon=True).start()
+                if not sem.acquire(blocking=False):
+                    client_sock.close()  # teto de conexões atingido
+                    continue
+                threading.Thread(target=self._handle_socks5, args=(client_sock, sem), daemon=True).start()
             srv.close()
         except Exception:
             pass
 
-    def _handle_socks5(self, sock):
+    def _handle_socks5(self, sock, sem=None):
+        # A conta do semáforo pertence a _fwd2 quando entregamos a conexão a
+        # ele; em qualquer outro caminho (erro / handshake inválido) liberamos
+        # aqui para não vazar a vaga.
+        handed_off = False
         try:
             hdr = sock.recv(2)
             if len(hdr) < 2: return
@@ -189,15 +229,20 @@ class TunnelManagerDialog(QDialog):
                 ch = self.ssh_mgr.client.get_transport().open_channel(
                     'direct-tcpip', (addr, port), ('127.0.0.1', 0))
                 sock.send(b'\x05\x00\x00\x01' + b'\x00' * 4 + b'\x00\x00')
-                threading.Thread(target=self._fwd2, args=(sock, ch), daemon=True).start()
+                threading.Thread(target=self._fwd2, args=(sock, ch, sem), daemon=True).start()
+                handed_off = True
             except Exception:
                 sock.send(b'\x05\x05\x00\x01' + b'\x00' * 4 + b'\x00\x00')
                 sock.close()
         except Exception:
             try: sock.close()
             except: pass
+        finally:
+            if sem is not None and not handed_off:
+                try: sem.release()
+                except Exception: pass
 
-    def _fwd2(self, a, b):
+    def _fwd2(self, a, b, sem=None):
         def _one(src, dst):
             try:
                 while True:
@@ -210,8 +255,15 @@ class TunnelManagerDialog(QDialog):
                 for x in (src, dst):
                     try: x.close()
                     except: pass
-        threading.Thread(target=_one, args=(a, b), daemon=True).start()
-        _one(b, a)
+        try:
+            threading.Thread(target=_one, args=(a, b), daemon=True).start()
+            _one(b, a)
+        finally:
+            # Libera a vaga do túnel quando a conexão encerra (ambos os lados
+            # já fecham no _one acima).
+            if sem is not None:
+                try: sem.release()
+                except Exception: pass
 
     def _stop_selected(self):
         row = self.tbl.currentRow()
@@ -343,7 +395,10 @@ class CronEditorDialog(QDialog):
             QMessageBox.critical(self, "Error", str(e))
 
 class ServiceManagerDialog(QDialog):
-    _sig_rows = pyqtSignal(list)
+    _sig_rows   = pyqtSignal(list)
+    _sig_log    = pyqtSignal(str)
+    _sig_reload = pyqtSignal()
+    _sig_ask_sudo = pyqtSignal(str, str)   # (action, service) -> pedir senha na GUI
 
     def __init__(self, parent, ssh_mgr, lang="en"):
         super().__init__(parent)
@@ -357,21 +412,32 @@ class ServiceManagerDialog(QDialog):
         tb = QHBoxLayout()
         self.filter_inp = QLineEdit(); self.filter_inp.setPlaceholderText("Filter services…"); self.filter_inp.textChanged.connect(self._filter)
         tb.addWidget(self.filter_inp, 1)
+        self.state_combo = QComboBox()
+        self.state_combo.addItems(["All", "running", "failed", "exited", "dead"])
+        self.state_combo.currentTextChanged.connect(self._filter)
+        tb.addWidget(self.state_combo)
         for lbl, icon, act in [
             ("Start",   'fa5s.play',         "start"),
             ("Stop",    'fa5s.stop',         "stop"),
             ("Restart", 'fa5s.redo',         "restart"),
             ("Enable",  'fa5s.toggle-on',    "enable"),
             ("Disable", 'fa5s.toggle-off',   "disable"),
+            ("Logs",    'fa5s.file-alt',     "__logs__"),
             ("Refresh", 'fa5s.sync',         None),
         ]:
             btn = QPushButton(lbl); btn.setIcon(qta.icon(icon, color='white'))
-            if act:
+            if act == "__logs__":
+                btn.clicked.connect(self._show_logs)
+            elif act:
                 btn.clicked.connect(lambda _, a=act: self._action(a))
             else:
                 btn.clicked.connect(self._load)
             tb.addWidget(btn)
         layout.addLayout(tb)
+
+        self.lbl_summary = QLabel("")
+        self.lbl_summary.setStyleSheet("font-weight: bold;")
+        layout.addWidget(self.lbl_summary)
 
         self.tbl = QTableWidget(0, 4)
         self.tbl.setHorizontalHeaderLabels(["Service", "Sub-state", "Active", "Enabled"])
@@ -381,10 +447,15 @@ class ServiceManagerDialog(QDialog):
         self.tbl.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         layout.addWidget(self.tbl)
 
-        self.log_area = QPlainTextEdit(); self.log_area.setReadOnly(True); self.log_area.setMaximumHeight(110)
+        self.log_area = QPlainTextEdit(); self.log_area.setReadOnly(True); self.log_area.setMaximumHeight(170)
+        self.log_area.setFont(QFont("Consolas", 9))
         layout.addWidget(QLabel("Command output:")); layout.addWidget(self.log_area)
 
         self._sig_rows.connect(self._populate)
+        self._sig_log.connect(self.log_area.appendPlainText)
+        self._sig_reload.connect(lambda: gui_single_shot(1500, self._load))
+        self._sig_ask_sudo.connect(self._ask_sudo_and_retry)
+        self._sudo_pwd = None
         self._load()
 
     def _load(self):
@@ -413,13 +484,21 @@ class ServiceManagerDialog(QDialog):
             self._all_rows = rows
             self._sig_rows.emit(rows)
         except Exception as e:
-            QTimer.singleShot(0, lambda: self.log_area.appendPlainText(f"Error: {e}"))
+            gui_single_shot(0, lambda: self.log_area.appendPlainText(f"Error: {e}"))
 
     def _populate(self, rows):
         text = self.filter_inp.text().lower()
+        state_f = self.state_combo.currentText()
+        n_run = sum(1 for _, sub, _, _ in rows if sub == "running")
+        n_fail = sum(1 for _, sub, _, _ in rows if sub == "failed")
+        self.lbl_summary.setText(
+            f"● {n_run} running    ● {n_fail} failed    ● {len(rows)} total")
+        self.lbl_summary.setStyleSheet(
+            "font-weight: bold; color: %s;" % ("#dc3545" if n_fail else "#28a745"))
         self.tbl.setRowCount(0)
         for name, sub, active, en in rows:
             if text and text not in name.lower(): continue
+            if state_f != "All" and sub != state_f: continue
             r = self.tbl.rowCount(); self.tbl.insertRow(r)
             self.tbl.setItem(r, 0, QTableWidgetItem(name))
             si = QTableWidgetItem(sub)
@@ -444,12 +523,52 @@ class ServiceManagerDialog(QDialog):
 
     def _run_action(self, action, svc):
         try:
-            _, out, err = self.ssh_mgr.execute(f"sudo -n systemctl {action} {svc} 2>&1")
+            if self._sudo_pwd:
+                # já temos a senha: roda direto com sudo -S
+                stdin, out, err = self.ssh_mgr.execute(
+                    f"sudo -S -p '' systemctl {sh_quote(action)} {sh_quote(svc)} 2>&1")
+                stdin.write(self._sudo_pwd + "\n"); stdin.flush()
+            else:
+                _, out, err = self.ssh_mgr.execute(
+                    f"sudo -n systemctl {sh_quote(action)} {sh_quote(svc)} 2>&1")
             output = (out.read() + err.read()).decode('utf-8', errors='replace').strip()
-            QTimer.singleShot(0, lambda: self.log_area.appendPlainText(f"$ systemctl {action} {svc}\n{output}"))
-            QTimer.singleShot(1500, self._load)
+            low = output.lower()
+            if "password is required" in low or "senha" in low and "necess" in low:
+                # sudo sem NOPASSWD: pede a senha na thread da GUI e tenta de novo
+                self._sig_ask_sudo.emit(action, svc)
+                return
+            if "incorrect password" in low or "sorry, try again" in low:
+                self._sudo_pwd = None
+                self._sig_log.emit("Sudo: incorrect password.")
+                return
+            self._sig_log.emit(f"$ systemctl {action} {svc}\n{output}")
+            self._sig_reload.emit()
         except Exception as e:
-            QTimer.singleShot(0, lambda: self.log_area.appendPlainText(f"Error: {e}"))
+            self._sig_log.emit(f"Error: {e}")
+
+    def _ask_sudo_and_retry(self, action, svc):
+        pwd, ok = QInputDialog.getText(self, "Sudo", t("enter_sudo", self.lang),
+                                       QLineEdit.EchoMode.Password)
+        if not ok or not pwd:
+            self._sig_log.emit("Sudo cancelled.")
+            return
+        self._sudo_pwd = pwd
+        threading.Thread(target=self._run_action, args=(action, svc), daemon=True).start()
+
+    def _show_logs(self):
+        row = self.tbl.currentRow()
+        if row < 0:
+            QMessageBox.warning(self, "No selection", "Select a service."); return
+        svc = self.tbl.item(row, 0).text()
+        def run():
+            try:
+                _, out, err = self.ssh_mgr.execute(
+                    f"journalctl -u {sh_quote(svc)} -n 100 --no-pager 2>&1 | tail -n 100")
+                text = (out.read() + err.read()).decode('utf-8', errors='replace').strip()
+                self._sig_log.emit(f"===== journalctl -u {svc} (last 100) =====\n{text}")
+            except Exception as e:
+                self._sig_log.emit(f"Error: {e}")
+        threading.Thread(target=run, daemon=True).start()
 
 class LogViewerDialog(QDialog):
     _sig_line = pyqtSignal(str)
@@ -518,24 +637,28 @@ class LogViewerDialog(QDialog):
         try:
             transport = self.ssh_mgr.client.get_transport()
             self._channel = transport.open_session()
-            self._channel.exec_command(f"tail -n 200 -f -- {path}")
+            self._channel.exec_command(f"tail -n 200 -f -- {sh_quote(path)}")
+            # recv bloqueante com timeout: acorda para checar stop_ev sem
+            # busy-poll (o antigo sleep(0.05) girava 20x/s à toa).
+            self._channel.settimeout(1.0)
             buf = ""
             while not self._stop_ev.is_set():
-                if self._channel.recv_ready():
-                    buf += self._channel.recv(4096).decode('utf-8', errors='replace')
-                    lines = buf.split('\n')
-                    buf = lines[-1]
-                    for ln in lines[:-1]:
-                        if ln: self._sig_line.emit(ln)
-                elif self._channel.exit_status_ready():
-                    break
-                else:
-                    time.sleep(0.05)
+                try:
+                    data = self._channel.recv(4096)
+                except socket.timeout:
+                    continue
+                if not data:
+                    break  # EOF: canal fechado
+                buf += data.decode('utf-8', errors='replace')
+                lines = buf.split('\n')
+                buf = lines[-1]
+                for ln in lines[:-1]:
+                    if ln: self._sig_line.emit(ln)
         except Exception as e:
             self._sig_line.emit(f"[Error: {e}]")
         finally:
-            QTimer.singleShot(0, lambda: self.btn_tail.setChecked(False))
-            QTimer.singleShot(0, lambda: self._toggle_tail(False))
+            gui_single_shot(0, lambda: self.btn_tail.setChecked(False))
+            gui_single_shot(0, lambda: self._toggle_tail(False))
 
     def _append_line(self, line):
         if self._filter_re and not self._filter_re.search(line):
@@ -919,7 +1042,7 @@ class PortMonitorDialog(QDialog):
             rows = self._parse(out.read().decode())
             self._sig_data.emit(rows)
         except Exception as e:
-            QTimer.singleShot(0, lambda: self.lbl_status.setText(f"Error: {e}"))
+            gui_single_shot(0, lambda: self.lbl_status.setText(f"Error: {e}"))
 
     def _parse(self, text):
         rows = []
@@ -1015,12 +1138,24 @@ class FleetDashboardWidget(QWidget):
         self._build_cards(); self._check_all()
 
     def _check_all(self):
-        for name, data in self.config_mgr.sessions.items():
-            if name in self._cards:
-                self._cards[name]['status_lbl'].setText("● Checking…")
-                threading.Thread(target=self._probe, args=(name, data.get('host', '')), daemon=True).start()
+        # Marca os cards no thread da GUI antes de sondar.
+        sessions = [(n, d) for n, d in self.config_mgr.sessions.items() if n in self._cards]
+        for name, _ in sessions:
+            self._cards[name]['status_lbl'].setText("● Checking…")
 
-    def _probe(self, name, host_str):
+        # Um dispatcher único limita a no máx. 20 sondagens simultâneas — com
+        # muitas sessões salvas, disparar uma thread por sessão de uma vez
+        # gerava uma explosão de threads no cliente.
+        def dispatch():
+            sem = threading.BoundedSemaphore(20)
+            for name, data in sessions:
+                sem.acquire()
+                threading.Thread(target=self._probe,
+                                 args=(name, data.get('host', ''), sem),
+                                 daemon=True).start()
+        threading.Thread(target=dispatch, daemon=True).start()
+
+    def _probe(self, name, host_str, sem=None):
         try:
             h = host_str.split('@')[-1].split(':')[0]
             port = int(host_str.split(':')[1]) if ':' in host_str.split('@')[-1] else 22
@@ -1029,6 +1164,10 @@ class FleetDashboardWidget(QWidget):
             self._sig_status.emit(name, "● Online" if ok else "● Offline")
         except Exception:
             self._sig_status.emit(name, "● Unreachable")
+        finally:
+            if sem is not None:
+                try: sem.release()
+                except Exception: pass
 
     def _update_status(self, name, status):
         card = self._cards.get(name)
@@ -1193,13 +1332,14 @@ class PackageManagerDialog(QDialog):
             _, out, err = self.ssh_mgr.execute(cmd)
             combined = (out.read() + err.read()).decode('utf-8', errors='replace').strip()
             self._sig_status.emit(combined[-2000:] if len(combined) > 2000 else combined)
-            QTimer.singleShot(1500, self._load)
+            gui_single_shot(1500, self._load)
         except Exception as e:
             self._sig_status.emit(f"Error: {e}")
 
     def _install(self):
         pkg = self.inp_pkg.text().strip()
         if not pkg: QMessageBox.warning(self, "No package", "Enter a package name."); return
+        pkg = sh_quote(pkg)
         install_cmds = {"apt": f"sudo -n apt install -y {pkg}",
                         "dnf": f"sudo -n dnf install -y {pkg}",
                         "yum": f"sudo -n yum install -y {pkg}",
@@ -1212,6 +1352,7 @@ class PackageManagerDialog(QDialog):
         if row < 0: QMessageBox.warning(self, "No selection", "Select a package."); return
         pkg = self.tbl.item(row, 0).text()
         if QMessageBox.question(self, "Confirm", f"Remove '{pkg}'?") != QMessageBox.StandardButton.Yes: return
+        pkg = sh_quote(pkg)
         remove_cmds = {"apt": f"sudo -n apt remove -y {pkg}",
                        "dnf": f"sudo -n dnf remove -y {pkg}",
                        "yum": f"sudo -n yum remove -y {pkg}",
@@ -1368,22 +1509,22 @@ class UserManagerDialog(QDialog):
             _, out, err = self.ssh_mgr.execute(cmd)
             combined = (out.read() + err.read()).decode('utf-8', errors='replace').strip()
             if combined: self._sig_log.emit(combined)
-            QTimer.singleShot(800, self._load_users)
-            QTimer.singleShot(800, self._load_groups)
+            gui_single_shot(800, self._load_users)
+            gui_single_shot(800, self._load_groups)
         except Exception as e:
             self._sig_log.emit(f"Error: {e}")
 
     def _add_user(self):
         name, ok = QInputDialog.getText(self, "Add User", "Username:")
         if not ok or not name.strip(): return
-        self._run_cmd(f"sudo -n useradd -m {name.strip()} 2>&1")
+        self._run_cmd(f"sudo -n useradd -m {sh_quote(name.strip())} 2>&1")
 
     def _delete_user(self):
         row = self.tbl_users.currentRow()
         if row < 0: return
         user = self.tbl_users.item(row, 0).text()
         if QMessageBox.question(self, "Confirm", f"Delete user '{user}'?") != QMessageBox.StandardButton.Yes: return
-        self._run_cmd(f"sudo -n userdel -r {user} 2>&1")
+        self._run_cmd(f"sudo -n userdel -r {sh_quote(user)} 2>&1")
 
     def _change_password(self):
         row = self.tbl_users.currentRow()
@@ -1391,19 +1532,33 @@ class UserManagerDialog(QDialog):
         user = self.tbl_users.item(row, 0).text()
         pwd, ok = QInputDialog.getText(self, "Change Password", f"New password for {user}:", QLineEdit.EchoMode.Password)
         if not ok or not pwd: return
-        self._run_cmd(f"echo '{user}:{pwd}' | sudo -n chpasswd 2>&1")
+        # A senha vai por STDIN do chpasswd (não por `echo`), então não aparece
+        # em `ps aux` nem em logs, e não há risco de injeção por aspas/apóstrofo.
+        self._sig_log.emit(f"$ chpasswd ({user})")
+        threading.Thread(target=self._chpasswd_thread, args=(user, pwd), daemon=True).start()
+
+    def _chpasswd_thread(self, user, pwd):
+        try:
+            stdin, out, err = self.ssh_mgr.execute("sudo -n chpasswd 2>&1")
+            stdin.write(f"{user}:{pwd}\n")
+            stdin.flush()
+            stdin.channel.shutdown_write()
+            combined = (out.read() + err.read()).decode('utf-8', errors='replace').strip()
+            self._sig_log.emit(combined if combined else "Password changed.")
+        except Exception as e:
+            self._sig_log.emit(f"Error: {e}")
 
     def _add_group(self):
         name, ok = QInputDialog.getText(self, "Add Group", "Group name:")
         if not ok or not name.strip(): return
-        self._run_cmd(f"sudo -n groupadd {name.strip()} 2>&1")
+        self._run_cmd(f"sudo -n groupadd {sh_quote(name.strip())} 2>&1")
 
     def _delete_group(self):
         row = self.tbl_groups.currentRow()
         if row < 0: return
         grp = self.tbl_groups.item(row, 0).text()
         if QMessageBox.question(self, "Confirm", f"Delete group '{grp}'?") != QMessageBox.StandardButton.Yes: return
-        self._run_cmd(f"sudo -n groupdel {grp} 2>&1")
+        self._run_cmd(f"sudo -n groupdel {sh_quote(grp)} 2>&1")
 
     def _add_to_group(self):
         row_g = self.tbl_groups.currentRow()
@@ -1412,7 +1567,7 @@ class UserManagerDialog(QDialog):
             QMessageBox.information(self, "Select both", "Select a user in Users tab and a group in Groups tab."); return
         grp  = self.tbl_groups.item(row_g, 0).text()
         user = self.tbl_users.item(row_u, 0).text()
-        self._run_cmd(f"sudo -n usermod -aG {grp} {user} 2>&1")
+        self._run_cmd(f"sudo -n usermod -aG {sh_quote(grp)} {sh_quote(user)} 2>&1")
 
 
 class FirewallDialog(QDialog):
@@ -1489,7 +1644,7 @@ class FirewallDialog(QDialog):
                     _, o3, _ = self.ssh_mgr.execute("which firewall-cmd 2>/dev/null")
                     if o3.read().decode().strip():
                         self._fw_type = "firewalld"
-            QTimer.singleShot(0, lambda: self.lbl_fw.setText(f"Firewall: {self._fw_type or 'Not detected'}"))
+            gui_single_shot(0, lambda: self.lbl_fw.setText(f"Firewall: {self._fw_type or 'Not detected'}"))
             if self._fw_type:
                 self._load_rules_thread(sudo_pwd)
         except Exception as e:
@@ -1527,14 +1682,19 @@ class FirewallDialog(QDialog):
                     stdin.write(sudo_pwd + "\n"); stdin.flush()
                 combined = (out.read() + err.read()).decode('utf-8', errors='replace').strip()
                 if combined: self._sig_status.emit(combined)
-                QTimer.singleShot(800, self._load_rules)
+                gui_single_shot(800, self._load_rules)
             except Exception as e:
                 self._sig_status.emit(f"Error: {e}")
         threading.Thread(target=_exec, daemon=True).start()
 
+    @staticmethod
+    def _valid_port(port):
+        return port.isdigit() and 1 <= int(port) <= 65535
+
     def _allow_port(self):
         port = self.inp_port.text().strip()
-        if not port: return
+        if not self._valid_port(port):
+            self._sig_status.emit("Invalid port (1-65535)."); return
         proto = self.combo_proto.currentText()
         if self._fw_type == "ufw":
             rule = f"{port}/{proto}" if proto != "any" else port
@@ -1547,7 +1707,8 @@ class FirewallDialog(QDialog):
 
     def _deny_port(self):
         port = self.inp_port.text().strip()
-        if not port: return
+        if not self._valid_port(port):
+            self._sig_status.emit("Invalid port (1-65535)."); return
         proto = self.combo_proto.currentText()
         if self._fw_type == "ufw":
             rule = f"{port}/{proto}" if proto != "any" else port
@@ -1558,15 +1719,29 @@ class FirewallDialog(QDialog):
         else:
             self._run_fw(f"sudo -n firewall-cmd --permanent --remove-port={port}/{proto if proto != 'any' else 'tcp'} && sudo -n firewall-cmd --reload")
 
+    @staticmethod
+    def _valid_ip(ip):
+        # IPv4 opcional com CIDR (ex.: 1.2.3.4 ou 10.0.0.0/8)
+        import re as _re
+        m = _re.fullmatch(r"(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})(/\d{1,2})?", ip)
+        if not m:
+            return False
+        if any(int(o) > 255 for o in m.groups()[:4]):
+            return False
+        if m.group(5) and int(m.group(5)[1:]) > 32:
+            return False
+        return True
+
     def _block_ip(self):
         ip = self.inp_ip.text().strip()
-        if not ip: return
+        if not self._valid_ip(ip):
+            self._sig_status.emit("Invalid IPv4 address."); return
         if self._fw_type == "ufw":
             self._run_fw(f"sudo -n ufw deny from {ip}")
         elif self._fw_type == "iptables":
             self._run_fw(f"sudo -n iptables -I INPUT -s {ip} -j DROP")
         else:
-            self._run_fw(f"sudo -n firewall-cmd --permanent --add-rich-rule='rule family=ipv4 source address={ip} drop' && sudo -n firewall-cmd --reload")
+            self._run_fw(f"sudo -n firewall-cmd --permanent --add-rich-rule={sh_quote(f'rule family=ipv4 source address={ip} drop')} && sudo -n firewall-cmd --reload")
 
     def _enable_fw(self):
         if self._fw_type == "ufw":
@@ -1584,4 +1759,308 @@ class FirewallDialog(QDialog):
             self._run_fw("sudo -n systemctl stop iptables 2>/dev/null || sudo -n service iptables stop 2>/dev/null")
         else:
             self._run_fw("sudo -n systemctl stop firewalld")
+
+class ContainerManagerDialog(QDialog):
+    """Painel visual Docker/Podman — containers, imagens, ações e logs."""
+    _sig_runtime    = pyqtSignal(str)
+    _sig_containers = pyqtSignal(list)
+    _sig_images     = pyqtSignal(list)
+    _sig_out        = pyqtSignal(str)
+    _sig_done       = pyqtSignal()   # ação concluída -> re-carrega (na thread da GUI)
+
+    def __init__(self, parent, ssh_mgr, lang="en"):
+        super().__init__(parent)
+        self.tab = parent            # ConnectionTab (para "Open Shell" no terminal)
+        self.ssh_mgr = ssh_mgr
+        self.lang = lang
+        self.runtime = None          # "docker" | "podman"
+        self._all_containers = []
+        self._all_images = []
+
+        self.setWindowTitle("Containers (Docker / Podman)")
+        self.resize(1040, 640)
+        layout = QVBoxLayout(self)
+
+        head = QHBoxLayout()
+        self.lbl_runtime = QLabel(t("ctn_detecting", lang))
+        self.lbl_runtime.setStyleSheet("font-weight: bold;")
+        head.addWidget(self.lbl_runtime)
+        head.addStretch()
+        self.chk_auto = QCheckBox(t("ctn_auto_refresh", lang))
+        self.chk_auto.toggled.connect(self._toggle_auto)
+        head.addWidget(self.chk_auto)
+        layout.addLayout(head)
+
+        self.tabs = QTabWidget()
+        layout.addWidget(self.tabs, 1)
+
+        # ---- aba Containers ---------------------------------------------
+        w_ctn = QWidget(); v_ctn = QVBoxLayout(w_ctn)
+        tb = QHBoxLayout()
+        self.filter_inp = QLineEdit()
+        self.filter_inp.setPlaceholderText(t("ctn_filter", lang))
+        self.filter_inp.textChanged.connect(lambda _: self._populate_containers(self._all_containers))
+        tb.addWidget(self.filter_inp, 1)
+        for lbl, icon, cb in [
+            (t("ctn_start", lang),   'fa5s.play',     lambda: self._ctn_action("start")),
+            (t("ctn_stop", lang),    'fa5s.stop',     lambda: self._ctn_action("stop")),
+            (t("ctn_restart", lang), 'fa5s.redo',     lambda: self._ctn_action("restart")),
+            (t("ctn_remove", lang),  'fa5s.trash',    self._ctn_remove),
+            (t("ctn_logs", lang),    'fa5s.file-alt', self._ctn_logs),
+            (t("ctn_shell", lang),   'fa5s.terminal', self._ctn_shell),
+            (t("refresh_list", lang),'fa5s.sync',     self.reload),
+        ]:
+            b = QPushButton(lbl); b.setIcon(qta.icon(icon, color='white'))
+            b.clicked.connect(cb); tb.addWidget(b)
+        v_ctn.addLayout(tb)
+
+        self.tbl_ctn = QTableWidget(0, 7)
+        self.tbl_ctn.setHorizontalHeaderLabels(
+            ["ID", t("ctn_name", lang), t("ctn_image", lang), t("ctn_state", lang),
+             "Status", t("ctn_ports", lang), "CPU / MEM"])
+        self.tbl_ctn.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.tbl_ctn.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.tbl_ctn.setColumnWidth(0, 95); self.tbl_ctn.setColumnWidth(3, 78)
+        self.tbl_ctn.setColumnWidth(4, 150); self.tbl_ctn.setColumnWidth(5, 150)
+        self.tbl_ctn.setColumnWidth(6, 120)
+        self.tbl_ctn.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.tbl_ctn.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        v_ctn.addWidget(self.tbl_ctn)
+        self.tabs.addTab(w_ctn, t("ctn_tab_containers", lang))
+
+        # ---- aba Images ---------------------------------------------------
+        w_img = QWidget(); v_img = QVBoxLayout(w_img)
+        tbi = QHBoxLayout()
+        self.pull_inp = QLineEdit()
+        self.pull_inp.setPlaceholderText("ubuntu:24.04, nginx:latest…")
+        tbi.addWidget(self.pull_inp, 1)
+        for lbl, icon, cb in [
+            (t("ctn_pull", lang),     'fa5s.download', self._img_pull),
+            (t("ctn_remove", lang),   'fa5s.trash',    self._img_remove),
+            (t("ctn_prune", lang),    'fa5s.broom',    self._img_prune),
+            (t("refresh_list", lang), 'fa5s.sync',     self.reload),
+        ]:
+            b = QPushButton(lbl); b.setIcon(qta.icon(icon, color='white'))
+            b.clicked.connect(cb); tbi.addWidget(b)
+        v_img.addLayout(tbi)
+
+        self.tbl_img = QTableWidget(0, 4)
+        self.tbl_img.setHorizontalHeaderLabels(
+            ["Repository", "Tag", "ID", t("ctn_size", lang)])
+        self.tbl_img.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.tbl_img.setColumnWidth(1, 120); self.tbl_img.setColumnWidth(2, 120)
+        self.tbl_img.setColumnWidth(3, 90)
+        self.tbl_img.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.tbl_img.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        v_img.addWidget(self.tbl_img)
+        self.tabs.addTab(w_img, t("ctn_tab_images", lang))
+
+        # ---- saída ---------------------------------------------------------
+        self.out = QPlainTextEdit(); self.out.setReadOnly(True)
+        self.out.setMaximumHeight(150)
+        self.out.setFont(QFont("Consolas", 9))
+        layout.addWidget(QLabel(t("ctn_output", lang)))
+        layout.addWidget(self.out)
+
+        self._timer = QTimer(self)
+        self._timer.setInterval(5000)
+        self._timer.timeout.connect(self.reload)
+
+        self._sig_runtime.connect(self._on_runtime)
+        self._sig_containers.connect(self._populate_containers)
+        self._sig_images.connect(self._populate_images)
+        self._sig_out.connect(self.out.appendPlainText)
+        self._sig_done.connect(lambda: gui_single_shot(800, self.reload))
+
+        threading.Thread(target=self._detect_runtime, daemon=True).start()
+
+    # ------------------------------------------------------------------ #
+    def closeEvent(self, event):
+        self._timer.stop()
+        super().closeEvent(event)
+
+    def _toggle_auto(self, on):
+        if on: self._timer.start()
+        else:  self._timer.stop()
+
+    def _run(self, cmd):
+        """Executa e retorna (stdout, stderr) — sempre chamado em thread de fundo."""
+        _, out, err = self.ssh_mgr.execute(cmd)
+        return (out.read().decode('utf-8', errors='replace'),
+                err.read().decode('utf-8', errors='replace'))
+
+    # ---- detecção -------------------------------------------------------
+    def _detect_runtime(self):
+        try:
+            out, _ = self._run(
+                "command -v docker >/dev/null 2>&1 && echo docker || "
+                "(command -v podman >/dev/null 2>&1 && echo podman || echo none)")
+            rt = out.strip().splitlines()[-1] if out.strip() else "none"
+            self._sig_runtime.emit(rt)
+        except Exception as e:
+            self._sig_out.emit(f"Error: {e}")
+
+    def _on_runtime(self, rt):
+        if rt not in ("docker", "podman"):
+            self.lbl_runtime.setText(t("ctn_not_found", self.lang))
+            self.lbl_runtime.setStyleSheet("font-weight: bold; color: #dc3545;")
+            return
+        self.runtime = rt
+        icon = "🐳" if rt == "docker" else "🦭"
+        self.lbl_runtime.setText(f"{icon} Runtime: {rt}")
+        self.reload()
+
+    # ---- carga ----------------------------------------------------------
+    def reload(self):
+        if not self.runtime: return
+        threading.Thread(target=self._load_thread, daemon=True).start()
+
+    def _load_thread(self):
+        rt = self.runtime
+        try:
+            fmt = "{{.ID}}|{{.Names}}|{{.Image}}|{{.State}}|{{.Status}}|{{.Ports}}"
+            out, err = self._run(f"{rt} ps -a --format '{fmt}' 2>&1")
+            if "permission denied" in (out + err).lower():
+                self._sig_out.emit(t("ctn_perm_hint", self.lang))
+            rows = []
+            for ln in out.splitlines():
+                parts = ln.split("|")
+                if len(parts) >= 6 and not ln.startswith(("Cannot", "Error", "error")):
+                    rows.append(parts[:6] + [""])
+            # stats (CPU/MEM) apenas dos containers em execução
+            try:
+                sfmt = "{{.ID}}|{{.CPUPerc}}|{{.MemUsage}}"
+                sout, _ = self._run(f"{rt} stats --no-stream --format '{sfmt}' 2>/dev/null")
+                stats = {}
+                for ln in sout.splitlines():
+                    p = ln.split("|")
+                    if len(p) >= 3:
+                        stats[p[0][:12]] = f"{p[1]} / {p[2].split('/')[0].strip()}"
+                for r in rows:
+                    r[6] = stats.get(r[0][:12], "")
+            except Exception:
+                pass
+            self._all_containers = rows
+            self._sig_containers.emit(rows)
+
+            ifmt = "{{.Repository}}|{{.Tag}}|{{.ID}}|{{.Size}}"
+            iout, _ = self._run(f"{rt} images --format '{ifmt}' 2>/dev/null")
+            imgs = [ln.split("|") for ln in iout.splitlines() if ln.count("|") >= 3]
+            self._all_images = imgs
+            self._sig_images.emit(imgs)
+        except Exception as e:
+            self._sig_out.emit(f"Error: {e}")
+
+    def _populate_containers(self, rows):
+        text = self.filter_inp.text().lower()
+        self.tbl_ctn.setRowCount(0)
+        running = 0
+        for row in rows:
+            cid, name, image, state, status, ports, res = (list(row) + [""] * 7)[:7]
+            if state == "running": running += 1
+            if text and text not in name.lower() and text not in image.lower():
+                continue
+            r = self.tbl_ctn.rowCount(); self.tbl_ctn.insertRow(r)
+            vals = [cid[:12], name, image, state, status, ports, res]
+            for c, val in enumerate(vals):
+                it = QTableWidgetItem(val)
+                if c == 3:
+                    if val == "running":  it.setForeground(QBrush(QColor("#28a745")))
+                    elif val in ("exited", "dead"): it.setForeground(QBrush(QColor("#dc3545")))
+                    elif val == "paused": it.setForeground(QBrush(QColor("#ffc107")))
+                self.tbl_ctn.setItem(r, c, it)
+        total = len(rows)
+        if self.runtime:
+            icon = "🐳" if self.runtime == "docker" else "🦭"
+            self.lbl_runtime.setText(
+                f"{icon} Runtime: {self.runtime}   •   {running}/{total} running")
+
+    def _populate_images(self, imgs):
+        self.tbl_img.setRowCount(0)
+        for img in imgs:
+            repo, tag, iid, size = (list(img) + [""] * 4)[:4]
+            r = self.tbl_img.rowCount(); self.tbl_img.insertRow(r)
+            for c, val in enumerate([repo, tag, iid[:12], size]):
+                self.tbl_img.setItem(r, c, QTableWidgetItem(val))
+
+    # ---- ações containers -----------------------------------------------
+    def _sel_container(self):
+        r = self.tbl_ctn.currentRow()
+        if r < 0:
+            QMessageBox.warning(self, "Containers", t("ctn_select_first", self.lang))
+            return None, None
+        return self.tbl_ctn.item(r, 0).text(), self.tbl_ctn.item(r, 1).text()
+
+    def _ctn_action(self, action):
+        cid, name = self._sel_container()
+        if not cid: return
+        self._exec_bg(f"{self.runtime} {sh_quote(action)} {sh_quote(cid)}", f"{action} {name}")
+
+    def _ctn_remove(self):
+        cid, name = self._sel_container()
+        if not cid: return
+        if QMessageBox.question(self, "Containers",
+                                f"{t('ctn_confirm_rm', self.lang)} {name}?") \
+                != QMessageBox.StandardButton.Yes:
+            return
+        self._exec_bg(f"{self.runtime} rm -f {sh_quote(cid)}", f"rm {name}")
+
+    def _ctn_logs(self):
+        cid, name = self._sel_container()
+        if not cid: return
+        def run():
+            try:
+                out, err = self._run(f"{self.runtime} logs --tail 200 {sh_quote(cid)} 2>&1")
+                self._sig_out.emit(f"===== logs: {name} (tail 200) =====\n{out or err}")
+            except Exception as e:
+                self._sig_out.emit(f"Error: {e}")
+        threading.Thread(target=run, daemon=True).start()
+
+    def _ctn_shell(self):
+        """Abre um shell dentro do container no terminal real do Nix."""
+        cid, name = self._sel_container()
+        if not cid: return
+        try:
+            cmd = (f"{self.runtime} exec -it {sh_quote(cid)} sh -c "
+                   f"'command -v bash >/dev/null && exec bash || exec sh'")
+            self.tab.output.send_text(cmd + "\r")
+            self.accept()
+        except Exception as e:
+            self._sig_out.emit(f"Error: {e}")
+
+    # ---- ações imagens ----------------------------------------------------
+    def _img_pull(self):
+        ref = self.pull_inp.text().strip()
+        if not ref: return
+        self._exec_bg(f"{self.runtime} pull {sh_quote(ref)}", f"pull {ref}", running_note=True)
+
+    def _img_remove(self):
+        r = self.tbl_img.currentRow()
+        if r < 0:
+            QMessageBox.warning(self, "Images", t("ctn_select_first", self.lang)); return
+        iid = self.tbl_img.item(r, 2).text()
+        repo = self.tbl_img.item(r, 0).text()
+        if QMessageBox.question(self, "Images",
+                                f"{t('ctn_confirm_rm', self.lang)} {repo} ({iid})?") \
+                != QMessageBox.StandardButton.Yes:
+            return
+        self._exec_bg(f"{self.runtime} rmi {sh_quote(iid)}", f"rmi {repo}")
+
+    def _img_prune(self):
+        if QMessageBox.question(self, "Images", t("ctn_confirm_prune", self.lang)) \
+                != QMessageBox.StandardButton.Yes:
+            return
+        self._exec_bg(f"{self.runtime} image prune -f", "image prune")
+
+    def _exec_bg(self, cmd, label, running_note=False):
+        if running_note:
+            self.out.appendPlainText(f"$ {label}  (running…)")
+        def run():
+            try:
+                out, err = self._run(cmd + " 2>&1")
+                self._sig_out.emit(f"$ {label}\n{(out or err).strip()}")
+            except Exception as e:
+                self._sig_out.emit(f"Error: {e}")
+            self._sig_done.emit()
+        threading.Thread(target=run, daemon=True).start()
 

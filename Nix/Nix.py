@@ -52,4 +52,8 @@ if __name__ == "__main__":
             window.show()
     else:
         window.show()
+    # Ctrl+C no console que iniciou o Nix não deve fechar o app (nem gerar
+    # traceback): só fecha pelo diálogo de saída da janela.
+    import signal
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
     sys.exit(app.exec())

@@ -1,0 +1,28 @@
+# --- Datos personales: NUNCA subir ---
+# config.json guarda sesiones (hosts, usuarios, contraseñas cifradas)
+# y el historial de comandos.
+config.json
+**/config.json
+known_hosts
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# --- Builds (se generan con installer/build_installer.ps1) ---
+build/
+dist/
+build_installer/
+dist_installer/
+# El instalador (.exe) y el ZIP van en GitHub Releases, no en el repositorio:
+# el .exe pasa de 100 MB, el límite de GitHub por archivo.
+installer_output/
+
+# --- Sistema / editores ---
+Thumbs.db
+desktop.ini
+.DS_Store
+.vscode/
+.idea/

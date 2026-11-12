@@ -1,7 +1,231 @@
 import os
+import re
 import stat
 import posixpath
 import time
+import shlex
+
+
+# ---------------------------------------------------------------------------
+#  Integração com o shell: o próprio shell informa usuário/pasta/screen
+# ---------------------------------------------------------------------------
+# Sequência invisível (OSC privado) que o hook imprime a cada prompt:
+#   ESC ] 7770 ; token ; usuário ; host ; STY ; pasta BEL
+# O token é aleatório por conexão: sem ele, um `cat arquivo_malicioso` poderia
+# forjar o relatório e fazer o Explorer trocar de pasta ou elevar o SFTP.
+_REPORT_PREFIX = "\x1b]7770;"
+_REPORT_RE = re.compile(r"\x1b\]7770;([^\x07\x1b]*)\x07")
+_REPORT_MAX_PENDING = 8192
+
+_PASSWORD_PROMPT_RE = re.compile(
+    r"(password|passwort|passphrase|pass phrase|senha|contrase[nñ]a|mot de passe)"
+    r"[^:：]*[:：]\s*$", re.IGNORECASE)
+# Prompt de shell. O caractere antes do '#' exclui o psql (postgres=#, -#, (#)
+# e o antes do '%' exclui progresso de download ("45%"). '>' fica de fora de
+# propósito: é o prompt de python, mysql, redis, sftp...
+_SHELL_PROMPT_RE = re.compile(
+    r"(?:(?:^|[^=\-('\"])#|\$|(?:^|[^\d])%|^\s*(?:➜|❯|λ).*)\s?$")
+
+
+def extract_shell_reports(text):
+    """Separa os relatórios do hook do fluxo do terminal.
+
+    Devolve (texto_limpo, relatórios, resto). `resto` é uma sequência cortada
+    no fim do chunk e deve ser prefixado ao próximo chunk. Cada relatório é uma
+    tupla (token, usuário, host, sty, pasta)."""
+    reports = []
+
+    def grab(match):
+        fields = match.group(1).split(";", 4)
+        if len(fields) == 5:
+            reports.append(tuple(fields))
+        return ""
+
+    clean = _REPORT_RE.sub(grab, text)
+    idx = clean.rfind("\x1b")
+    if idx >= 0:
+        tail = clean[idx:]
+        if _REPORT_PREFIX.startswith(tail) or (
+                tail.startswith(_REPORT_PREFIX) and len(tail) < _REPORT_MAX_PENDING):
+            return clean[:idx], reports, tail
+    return clean, reports, ""
+
+
+def is_password_prompt(line):
+    """A linha do cursor é um prompt de senha (sudo, su, ssh...)?"""
+    return bool(_PASSWORD_PROMPT_RE.search(line or ""))
+
+
+def is_sudo_prompt(line):
+    """Prompt de senha do sudo, isto é, a senha do PRÓPRIO usuário conectado."""
+    return "[sudo]" in (line or "") and is_password_prompt(line)
+
+
+def is_shell_prompt(line):
+    """A linha do cursor parece um prompt de shell esperando comando?"""
+    return bool(line and line.strip() and not is_password_prompt(line)
+                and _SHELL_PROMPT_RE.search(line))
+
+
+def is_initial_prompt(line):
+    """Critério mais flexível, usado só logo após o login de bash/zsh: aceita
+    temas sem $/# no fim, mas nunca uma pergunta (troca de senha, MFA...)."""
+    text = (line or "").strip()
+    return bool(text) and not is_password_prompt(line) and text[-1] not in ":?："
+
+
+def build_shell_hook(token, erase_rows):
+    """Linha enviada ao shell para ele passar a informar seu estado.
+
+    Precisa ser analisável por bash, zsh e dash. Dentro do GNU screen a
+    sequência vai embrulhada em DCS, senão o screen a descartaria. No fim a
+    própria linha apaga seu eco (erase_rows linhas acima), de modo que funciona
+    também através do screen, que mantém uma cópia própria da tela. O espaço
+    inicial e o `history -d` a mantêm fora do histórico do bash."""
+    return (
+        " __nix_t=" + sh_quote(token) + ";__nix_u=$(id -un);__nix_h=$(uname -n);"
+        "__nix_r(){ __nix_s=$?;__nix_f='\\033]7770;%s;%s;%s;%s;%s\\007';"
+        "[ -z \"${STY:-}\" ]||__nix_f=\"\\033P$__nix_f\\033\\\\\\\\\";"
+        "printf \"$__nix_f\" \"$__nix_t\" \"$__nix_u\" \"$__nix_h\" \"${STY:-}\" \"$PWD\";"
+        "return $__nix_s;};"
+        "if [ -n \"${BASH_VERSION:-}\" ];then history -d $HISTCMD 2>/dev/null;"
+        "case \"${PROMPT_COMMAND:-}\" in *__nix_r*);;"
+        "*)PROMPT_COMMAND=\"__nix_r;${PROMPT_COMMAND:-}\";;esac;"
+        "elif [ -n \"${ZSH_VERSION:-}\" ];then "
+        "eval 'precmd_functions=(${precmd_functions:#__nix_r} __nix_r)';fi;"
+        f"printf '\\033[{int(erase_rows)}A\\r\\033[J';__nix_r"
+    )
+
+
+# Teto de profundidade nas descidas recursivas de diretório. Protege contra
+# árvores muito fundas / ciclos por symlink no servidor remoto, que poderiam
+# estourar a pilha (RecursionError) ou rodar indefinidamente.
+MAX_RECURSION_DEPTH = 64
+
+
+def sh_quote(value):
+    """Escapa um valor para uso seguro como UM argumento em comando shell POSIX.
+
+    Use SEMPRE isto ao interpolar input do usuário (nome de arquivo, usuário,
+    nome de screen, porta, IP, path...) em comandos enviados ao servidor —
+    evita command injection. shlex.quote envolve em aspas simples e trata o
+    caso da própria aspa simples; string vazia vira ''.
+    """
+    return shlex.quote("" if value is None else str(value))
+
+class TransferCancelled(Exception):
+    """Levantada dentro do callback de progresso para abortar um upload/download."""
+
+
+# ---------------------------------------------------------------------------
+#  Autocompletar com Tab (estilo bash)
+# ---------------------------------------------------------------------------
+_CMD_WORDS = {"sudo", "time", "xargs", "env", "nohup", "exec", "watch", "command"}
+_SHELL_SPECIALS = set(" \t\n!\"#$&'()*;<>?[\\]^`{|}~")
+
+
+def split_completion_context(text):
+    """Analisa o texto ANTES do cursor e devolve o contexto da palavra atual.
+
+    Retorna dict: start (índice onde a palavra começa), value (palavra sem
+    aspas/escapes — é o que se completa no servidor), quote (aspa aberta ou
+    None) e cmd_pos (True se a palavra está em posição de comando: início da
+    linha, depois de | ; && || ou depois de sudo/time/...).
+    """
+    tokens = []          # valores das palavras/separadores já fechados
+    start = None
+    value = []
+    quote = None
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if quote:
+            if ch == quote:
+                quote = None
+            elif ch == "\\" and quote == '"' and i + 1 < n and text[i + 1] in '"\\$`':
+                i += 1
+                value.append(text[i])
+            else:
+                value.append(ch)
+        elif ch == "\\" and i + 1 < n:
+            if start is None:
+                start = i
+            i += 1
+            value.append(text[i])
+        elif ch in "'\"":
+            if start is None:
+                start = i
+            quote = ch
+        elif ch.isspace():
+            if start is not None:
+                tokens.append("".join(value))
+                start, value = None, []
+        elif ch in "|;&":
+            if start is not None:
+                tokens.append("".join(value))
+                start, value = None, []
+            tokens.append("|")   # todos os separadores equivalem a "novo comando"
+        else:
+            if start is None:
+                start = i
+            value.append(ch)
+        i += 1
+    if start is None:
+        start = n
+    prev = tokens[-1] if tokens else None
+    cmd_pos = prev is None or prev == "|" or prev in _CMD_WORDS
+    return {"start": start, "value": "".join(value), "quote": quote, "cmd_pos": cmd_pos}
+
+
+def build_completion_script(cwd, word, cmd_mode):
+    """Comando remoto que lista candidatos via `compgen` do bash (dirs com '/')."""
+    return (
+        "bash -c 'cd \"$1\" 2>/dev/null; "
+        "if [ \"$3\" = cmd ]; then compgen -c -- \"$2\" | sort -u | head -n 300; "
+        "else compgen -f -- \"$2\" | head -n 500 | while IFS= read -r f; do "
+        "if [ -d \"$f\" ]; then printf \"%s/\\n\" \"$f\"; else printf \"%s\\n\" \"$f\"; fi; "
+        "done; fi' _ " + sh_quote(cwd) + " " + sh_quote(word) + " "
+        + ("cmd" if cmd_mode else "file")
+    )
+
+
+def escape_completion(word, quote):
+    """Escapa `word` para inserção na linha de comando respeitando a aspa aberta."""
+    if quote == "'":
+        return word.replace("'", "'\\''")
+    if quote == '"':
+        return "".join("\\" + c if c in '"\\$`' else c for c in word)
+    out = []
+    for idx, c in enumerate(word):
+        out.append("\\" + c if (c in _SHELL_SPECIALS and not (idx == 0 and c == "~")) else c)
+    return "".join(out)
+
+
+def compute_completion(ctx, matches, home=""):
+    """Dado o contexto e os candidatos, calcula o que inserir.
+
+    Retorna (texto_a_inserir, lista_de_opcoes_para_exibir). Se `texto_a_inserir`
+    for None não há progresso possível (mostrar as opções).
+    """
+    value = ctx["value"]
+    quote = ctx["quote"]
+    tilde = value.startswith("~") and home
+    if tilde:
+        matches = [("~" + m[len(home):]) if m.startswith(home) else m for m in matches]
+    matches = sorted(set(matches))
+    if not matches:
+        return None, []
+    common = os.path.commonprefix(matches)
+    if len(matches) == 1:
+        m = matches[0]
+        done = escape_completion(m, quote)
+        if m.endswith("/"):
+            return done, matches            # diretório: continua digitando
+        return done + (quote or "") + " ", matches
+    if len(common) > len(value):
+        return escape_completion(common, quote), matches
+    return None, matches
+
 
 def parse_monitor_output(output):
     """
@@ -127,26 +351,29 @@ def parse_monitor_output(output):
             
     return cpu_usage, mem_usage, procs, net_bytes, users, mem_details
 
-def upload_recursive(ssh_mgr, local_path, remote_path, sudo_pwd_list, get_sudo_pwd_func, progress_cb=None):
+def upload_recursive(ssh_mgr, local_path, remote_path, sudo_pwd_list, get_sudo_pwd_func, progress_cb=None, _depth=0):
     """
-    Faz upload recursivo de arquivos ou pastas e aplica elevação via sudo 
+    Faz upload recursivo de arquivos ou pastas e aplica elevação via sudo
     caso receba "Permission denied".
     """
-    if os.path.isdir(local_path):
+    if _depth > MAX_RECURSION_DEPTH:
+        raise Exception(f"Profundidade máxima ({MAX_RECURSION_DEPTH}) excedida em {local_path}")
+    if os.path.isdir(local_path) and not os.path.islink(local_path):
         try:
             with ssh_mgr.lock:
                 ssh_mgr.sftp.mkdir(remote_path)
         except IOError:
             pass
-        
+
         for item in os.listdir(local_path):
             upload_recursive(
-                ssh_mgr, 
-                os.path.join(local_path, item), 
-                posixpath.join(remote_path, item), 
-                sudo_pwd_list, 
-                get_sudo_pwd_func, 
-                progress_cb
+                ssh_mgr,
+                os.path.join(local_path, item),
+                posixpath.join(remote_path, item),
+                sudo_pwd_list,
+                get_sudo_pwd_func,
+                progress_cb,
+                _depth + 1,
             )
     else:
         try:
@@ -164,9 +391,7 @@ def upload_recursive(ssh_mgr, local_path, remote_path, sudo_pwd_list, get_sudo_p
                 with ssh_mgr.lock:
                     ssh_mgr.sftp.put(local_path, tmp_path, callback=progress_cb)
                     
-                safe_tmp = tmp_path.replace('"', '\\"')
-                safe_remote = remote_path.replace('"', '\\"')
-                cmd = f'sudo -S mv "{safe_tmp}" "{safe_remote}"'
+                cmd = f'sudo -S mv {sh_quote(tmp_path)} {sh_quote(remote_path)}'
                 
                 stdin, stdout, stderr = ssh_mgr.execute(cmd)
                 stdin.write(sudo_pwd_list[0] + "\n")
@@ -179,26 +404,33 @@ def upload_recursive(ssh_mgr, local_path, remote_path, sudo_pwd_list, get_sudo_p
             else:
                 raise e
 
-def count_remote_size(ssh_mgr, remote_path):
+def count_remote_size(ssh_mgr, remote_path, _depth=0):
     """Conta o total de bytes em uma árvore de diretório remoto."""
     total = 0
+    if _depth > MAX_RECURSION_DEPTH:
+        return total
     try:
         with ssh_mgr.lock:
             items = ssh_mgr.sftp.listdir_attr(remote_path)
         for item in items:
             rem = posixpath.join(remote_path, item.filename)
+            # Ignora symlinks: seguir links pode gerar ciclos / contagem dupla.
+            if stat.S_ISLNK(item.st_mode):
+                continue
             if stat.S_ISDIR(item.st_mode):
-                total += count_remote_size(ssh_mgr, rem)
+                total += count_remote_size(ssh_mgr, rem, _depth + 1)
             else:
                 total += item.st_size or 0
     except Exception:
         pass
     return total
 
-def download_directory_recursive(ssh_mgr, remote_dir, local_dir, progress_cb=None):
+def download_directory_recursive(ssh_mgr, remote_dir, local_dir, progress_cb=None, _depth=0):
     """
     Faz download de diretórios inteiros via SFTP mantendo a estrutura local.
     """
+    if _depth > MAX_RECURSION_DEPTH:
+        raise Exception(f"Profundidade máxima ({MAX_RECURSION_DEPTH}) excedida em {remote_dir}")
     if not os.path.exists(local_dir):
         os.makedirs(local_dir)
 
@@ -209,18 +441,22 @@ def download_directory_recursive(ssh_mgr, remote_dir, local_dir, progress_cb=Non
         rem_path = posixpath.join(remote_dir, item.filename)
         loc_path = os.path.join(local_dir, item.filename)
 
+        if stat.S_ISLNK(item.st_mode):
+            continue  # não segue symlinks: evita ciclos e escapes de path
         if stat.S_ISDIR(item.st_mode):
-            download_directory_recursive(ssh_mgr, rem_path, loc_path, progress_cb)
+            download_directory_recursive(ssh_mgr, rem_path, loc_path, progress_cb, _depth + 1)
         else:
             with ssh_mgr.lock:
                 ssh_mgr.sftp.get(rem_path, loc_path, callback=progress_cb)
 
-def download_directory_with_progress(ssh_mgr, remote_dir, local_dir, total_bytes, transferred_ref, progress_cb=None):
+def download_directory_with_progress(ssh_mgr, remote_dir, local_dir, total_bytes, transferred_ref, progress_cb=None, _depth=0):
     """
     Download recursivo com rastreamento de progresso cumulativo correto.
     transferred_ref: lista [int] com bytes acumulados de arquivos já concluídos.
     total_bytes: tamanho total pré-calculado de toda a árvore remota.
     """
+    if _depth > MAX_RECURSION_DEPTH:
+        raise Exception(f"Profundidade máxima ({MAX_RECURSION_DEPTH}) excedida em {remote_dir}")
     if not os.path.exists(local_dir):
         os.makedirs(local_dir)
 
@@ -231,8 +467,10 @@ def download_directory_with_progress(ssh_mgr, remote_dir, local_dir, total_bytes
         rem = posixpath.join(remote_dir, item.filename)
         loc = os.path.join(local_dir, item.filename)
 
+        if stat.S_ISLNK(item.st_mode):
+            continue  # não segue symlinks: evita ciclos e escapes de path
         if stat.S_ISDIR(item.st_mode):
-            download_directory_with_progress(ssh_mgr, rem, loc, total_bytes, transferred_ref, progress_cb)
+            download_directory_with_progress(ssh_mgr, rem, loc, total_bytes, transferred_ref, progress_cb, _depth + 1)
         else:
             file_size = item.st_size or 0
             base = transferred_ref[0]
@@ -254,7 +492,9 @@ def fetch_os_info(ssh_mgr):
 
     def run(cmd):
         try:
-            _, stdout, _ = ssh_mgr.execute(cmd)
+            # timeout evita que um comando de hardware travado (ex.: nvidia-smi
+            # com driver quebrado) prenda a thread e vaze a sessão do servidor.
+            _, stdout, _ = ssh_mgr.execute(cmd, timeout=15)
             return stdout.read().decode('utf-8', errors='replace').strip()
         except Exception:
             return ""

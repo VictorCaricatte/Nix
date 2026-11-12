@@ -1,0 +1,8 @@
+# Fin de línea uniforme (LF) en el repositorio, sea cual sea el sistema
+* text=auto eol=lf
+*.ps1 text eol=crlf
+*.iss text eol=crlf
+
+*.ico binary
+*.jpg binary
+*.png binary

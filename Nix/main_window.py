@@ -12,10 +12,10 @@ from PyQt6.QtWidgets import (
     QFrame, QLabel, QLineEdit, QPushButton, QSizePolicy,
     QFileDialog, QInputDialog, QMessageBox, QMenu, QColorDialog,
     QDockWidget, QTabWidget, QComboBox, QScrollArea, QSystemTrayIcon,
-    QCheckBox,
+    QCheckBox, QDialog, QDialogButtonBox,
 )
 from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QColor, QAction, QPixmap, QIcon
+from PyQt6.QtGui import QColor, QAction, QPixmap, QIcon, QKeySequence
 
 from config import ConfigManager, encrypt_password, decrypt_password
 from i18n import t
@@ -28,6 +28,9 @@ def resource_path(relative_path):
     except Exception:
         base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
+
+TERM_STYLES = ["standard", "retro", "matrix", "crt", "crt_blue"]
+
 
 class Interface(QMainWindow):
     def __init__(self):
@@ -99,15 +102,46 @@ class Interface(QMainWindow):
             (t("theme",      lang), 'fa5s.palette',   self.change_theme_color),
             (t("bg_color",   lang), 'fa5s.fill-drip', self.change_bg_color),
             (t("term_color", lang), 'fa5s.font',      self.change_terminal_color),
-            (t("term_style", lang), 'fa5s.terminal',  self.cycle_term_style),
-            (t("layout",     lang), 'fa5s.columns',   self.toggle_layout),
-            (t("language",   lang), 'fa5s.language',  self.toggle_language),
+            (t("term_style", lang), 'fa5s.terminal',  "SUB_STYLE"),
+            (t("layout",     lang), 'fa5s.columns',   "SUB_LAYOUT"),
+            (t("language",   lang), 'fa5s.language',  "SUB_LANG"),
         ]:
+            if slot == "SUB_LANG":
+                self._fill_choice_menu(
+                    menu.addMenu(qta.icon(icon_name, color=ic), label),
+                    [("en", "English"), ("pt", "Português"), ("es", "Español")],
+                    lang, self.set_language)
+                continue
+            if slot == "SUB_STYLE":
+                self._fill_choice_menu(
+                    menu.addMenu(qta.icon(icon_name, color=ic), label),
+                    [(n, t(f"style_{n}", lang)) for n in TERM_STYLES],
+                    self.config_mgr.theme.get("term_style", "standard"),
+                    self.set_term_style)
+                continue
+            if slot == "SUB_LAYOUT":
+                self._fill_choice_menu(
+                    menu.addMenu(qta.icon(icon_name, color=ic), label),
+                    [("classic", t("layout_classic", lang)), ("dock", t("layout_dock", lang))],
+                    self.config_mgr.theme.get("layout", "classic"),
+                    self.set_layout)
+                continue
             act = QAction(qta.icon(icon_name, color=ic), label, self)
             act.triggered.connect(slot)
             menu.addAction(act)
         menu.exec(self.btn_settings_menu.mapToGlobal(
             self.btn_settings_menu.rect().bottomLeft()))
+
+    @staticmethod
+    def _fill_choice_menu(submenu, choices, current, on_pick):
+        """Preenche um submenu com opções exclusivas (a atual vem marcada), para
+        escolher direto em vez de ciclar uma a uma."""
+        for key, label in choices:
+            act = QAction(label, submenu)
+            act.setCheckable(True)
+            act.setChecked(key == current)
+            act.triggered.connect(lambda _=False, k=key: on_pick(k))
+            submenu.addAction(act)
 
     def _open_fleet_tab(self):
         if self._fleet_widget is not None:
@@ -129,6 +163,7 @@ class Interface(QMainWindow):
             (t("env_list",       lang),  'fa5s.cubes',          lambda: self.current_tab.show_env_list() if self.current_tab else None),
             (t("local_explorer", lang),  'fa5s.laptop',         self.open_local_explorer),
             (t("batch_exec",     lang),  'fa5s.layer-group',    self._open_batch_exec),
+            (t("shortcuts",      lang),  'fa5s.keyboard',       self.show_shortcuts),
         ]:
             act = QAction(qta.icon(icon_name, color=ic), label, self)
             act.triggered.connect(slot)
@@ -137,6 +172,22 @@ class Interface(QMainWindow):
             self.btn_tools_menu.rect().bottomLeft()))
 
     def _setup_shortcuts(self):
+        from terminal import PyteTerminal
+
+        def guarded(key, fn):
+            # Se o terminal está com foco, a F-key pertence ao app remoto
+            # (ex.: F10 = sair do htop) — repassa em vez de executar o atalho
+            # do Nix (F10 desconectava o servidor no meio do htop!).
+            def run():
+                w = QApplication.focusWidget()
+                while w is not None:
+                    if isinstance(w, PyteTerminal):
+                        w.send_fkey(key)
+                        return
+                    w = w.parentWidget()
+                fn()
+            return run
+
         for key, fn in [
             ("F5",  lambda: self.current_tab.sig_explorer.emit() if self.current_tab and self.current_tab.ssh_mgr.is_connected else None),
             ("F6",  lambda: self.current_tab.shortcut_rename()   if self.current_tab else None),
@@ -144,8 +195,55 @@ class Interface(QMainWindow):
             ("F8",  lambda: self.current_tab.shortcut_delete()   if self.current_tab else None),
             ("F9",  lambda: self.current_tab.clear_terminal()    if self.current_tab else None),
             ("F10", self.handle_connection),
+            ("F1",  self.show_shortcuts),
         ]:
-            act = QAction(self); act.setShortcut(key); act.triggered.connect(fn); self.addAction(act)
+            act = QAction(self); act.setShortcut(key); act.triggered.connect(guarded(key, fn)); self.addAction(act)
+
+        # Atalhos do Nix que NÃO conflitam com o shell remoto (Ctrl+T/W/L etc.
+        # pertencem ao bash/readline, por isso as abas usam Ctrl+Shift).
+        def add(keys, fn):
+            act = QAction(self)
+            act.setShortcuts([QKeySequence(k) for k in keys])
+            act.triggered.connect(fn)
+            self.addAction(act)
+
+        add(["Ctrl+Shift+T"], self.add_tab)
+        add(["Ctrl+Shift+W"], lambda: self.close_tab(self.tab_widget.currentIndex()))
+        add(["Ctrl+Tab", "Ctrl+PgDown"], lambda: self._cycle_tab(1))
+        add(["Ctrl+Shift+Tab", "Ctrl+Shift+Backtab", "Ctrl+PgUp"], lambda: self._cycle_tab(-1))
+        add(["Ctrl++", "Ctrl+="], self.increase_font)
+        add(["Ctrl+-"], self.decrease_font)
+        add(["Ctrl+0"], self.reset_font)
+        add(["Ctrl+Shift+M"], lambda: self.current_tab.toggle_monitor_panel() if self.current_tab else None)
+
+    def _cycle_tab(self, step):
+        n = self.tab_widget.count()
+        if n > 1:
+            self.tab_widget.setCurrentIndex((self.tab_widget.currentIndex() + step) % n)
+
+    def show_shortcuts(self):
+        lang = self.config_mgr.language
+        rows = [
+            ("Ctrl+Shift+T", "sc_new_tab"), ("Ctrl+Shift+W", "sc_close_tab"),
+            ("Ctrl+Tab / Ctrl+PgDn", "sc_next_tab"), ("Ctrl+Shift+Tab / Ctrl+PgUp", "sc_prev_tab"),
+            ("Ctrl + / Ctrl =", "sc_zoom_in"), ("Ctrl -", "sc_zoom_out"), ("Ctrl 0", "sc_zoom_reset"), ("Ctrl+Shift+M", "sc_monitor"),
+            ("Ctrl + wheel", "sc_wheel"), ("Tab", "sc_tab"),
+            ("F1", "sc_help"), ("F5", "sc_refresh"), ("F6", "sc_rename"), ("F7", "sc_mkdir"),
+            ("F8", "sc_delete"), ("F9", "sc_clear"), ("F10", "sc_connect"),
+        ]
+        html = "<table cellpadding='4'>" + "".join(
+            f"<tr><td><b>{k}</b></td><td>{t(v, lang)}</td></tr>" for k, v in rows
+        ) + "</table><p>" + t("shortcuts_hint", lang) + "</p>"
+        dlg = QDialog(self)
+        dlg.setWindowTitle(t("shortcuts", lang))
+        lay = QVBoxLayout(dlg)
+        lbl = QLabel(html)
+        lbl.setTextFormat(Qt.TextFormat.RichText)
+        lay.addWidget(lbl)
+        box = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        box.rejected.connect(dlg.reject)
+        lay.addWidget(box)
+        dlg.exec()
 
     def _setup_tray(self):
         if not QSystemTrayIcon.isSystemTrayAvailable():
@@ -192,14 +290,33 @@ class Interface(QMainWindow):
             self.tab_widget.widget(i).ssh_mgr.is_connected
             for i in range(self.tab_widget.count())
         )
-        if self.tray_icon and any_connected:
-            event.ignore()
-            self.hide()
-            self._act_show_hide.setText(t("tray_show", self.config_mgr.language))
-            self.tray_icon.showMessage("Nix", "Nix is minimized to tray.",
-                                       QSystemTrayIcon.MessageIcon.Information, 2000)
+        if any_connected:
+            lang = self.config_mgr.language
+            box = QMessageBox(self)
+            box.setWindowTitle("Nix")
+            box.setIcon(QMessageBox.Icon.Question)
+            box.setText(t("close_msg", lang))
+            btn_quit = box.addButton(t("close_quit", lang), QMessageBox.ButtonRole.DestructiveRole)
+            box.addButton(t("transfer_cancel", lang), QMessageBox.ButtonRole.RejectRole)
+            box.exec()
+            if box.clickedButton() is btn_quit:
+                self._disconnect_all()
+                event.accept()
+                QApplication.quit()
+            else:
+                event.ignore()
         else:
+            self._disconnect_all()
             event.accept()
+
+    def _disconnect_all(self):
+        for i in range(self.tab_widget.count()):
+            w = self.tab_widget.widget(i)
+            if isinstance(w, ConnectionTab) and w.ssh_mgr.is_connected:
+                try:
+                    w.ssh_mgr.disconnect()
+                except Exception:
+                    pass
 
     @property
     def current_tab(self):
@@ -212,7 +329,9 @@ class Interface(QMainWindow):
         tab.sig_conn_update.connect(self._on_tab_conn_update)
         tab.sig_tab_title.connect(self._on_tab_title_changed)
         tab.sig_notify.connect(self._show_tray_notification)
+        tab.sig_conn_state.connect(self._on_tab_state_changed)
         idx = self.tab_widget.addTab(tab, t("new_tab", lang))
+        self._on_tab_state_changed(tab, "idle")
         self.tab_widget.setCurrentIndex(idx)
         tab.update_texts(lang)
 
@@ -248,6 +367,22 @@ class Interface(QMainWindow):
             self.btn_conn.setEnabled(enabled)
             self.btn_conn.setText(text)
 
+    _STATE_COLORS = {"connected": "#28a745", "connecting": "#ffb000",
+                     "lost": "#dc3545", "idle": "#888888"}
+
+    def _on_tab_state_changed(self, tab, state):
+        """Bolinha colorida na aba: verde conectado, âmbar conectando, vermelho
+        conexão perdida, cinza desconectado."""
+        idx = self.tab_widget.indexOf(tab)
+        if idx < 0:
+            return
+        color = self._STATE_COLORS.get(state, "#888888")
+        self.tab_widget.tabBar().setTabIcon(idx, qta.icon('fa5s.circle', color=color))
+        lang = self.config_mgr.language
+        tips = {"connected": t("disconnect", lang), "connecting": t("connecting", lang),
+                "lost": t("conn_lost_title", lang), "idle": t("connect", lang)}
+        self.tab_widget.tabBar().setTabToolTip(idx, tips.get(state, ""))
+
     def _on_tab_title_changed(self, tab, title):
         idx = self.tab_widget.indexOf(tab)
         if idx >= 0:
@@ -260,10 +395,22 @@ class Interface(QMainWindow):
         lang = self.config_mgr.language
 
         self.conn_inner = self.create_card()
-        self.conn_inner.setMaximumHeight(60)
         self.conn_inner.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        conn_layout = QHBoxLayout(self.conn_inner)
+        conn_outer = QVBoxLayout(self.conn_inner)
+        conn_outer.setContentsMargins(0, 0, 0, 0)
+        conn_outer.setSpacing(0)
+        self.conn_row1 = QWidget()
+        conn_layout = QHBoxLayout(self.conn_row1)
         conn_layout.setContentsMargins(10, 5, 5, 5)
+        # 2ª linha (só no modo compacto): chave SSH e X11, atrás do botão "..."
+        self.conn_row2 = QWidget()
+        self._row2_layout = QHBoxLayout(self.conn_row2)
+        self._row2_layout.setContentsMargins(10, 0, 10, 6)
+        self.conn_row2.hide()
+        conn_outer.addWidget(self.conn_row1)
+        conn_outer.addWidget(self.conn_row2)
+        self._conn_compact = False
+        self._conn_scroll = None
 
         self.logo_label = QLabel()
         pixmap = QPixmap(resource_path("Nix.jpg"))
@@ -288,13 +435,31 @@ class Interface(QMainWindow):
         self.btn_show_pass.toggled.connect(lambda c: self.entry_pass.setEchoMode(
             QLineEdit.EchoMode.Normal if c else QLineEdit.EchoMode.Password))
 
-        btn_browse_key = QPushButton()
+        btn_browse_key = self.btn_browse_key = QPushButton()
         btn_browse_key.setIcon(qta.icon('fa5s.folder-open', color='white'))
         btn_browse_key.setFixedWidth(40); btn_browse_key.clicked.connect(self.browse_ssh_key)
+
+        self.btn_more = QPushButton()
+        self.btn_more.setIcon(qta.icon('fa5s.ellipsis-h', color='white'))
+        self.btn_more.setFixedWidth(40)
+        self.btn_more.setCheckable(True)
+        self.btn_more.setVisible(False)
+        self.btn_more.toggled.connect(self._toggle_conn_row2)
 
         self.btn_save = QPushButton()
         self.btn_save.setIcon(qta.icon('fa5s.save', color='white'))
         self.btn_save.setFixedWidth(40); self.btn_save.clicked.connect(self.save_current_session)
+
+        self.btn_manage_sessions = QPushButton()
+        self.btn_manage_sessions.setIcon(qta.icon('fa5s.list', color='white'))
+        self.btn_manage_sessions.setFixedWidth(40)
+        self.btn_manage_sessions.clicked.connect(self.manage_sessions)
+
+        self.btn_edit_session = QPushButton()
+        self.btn_edit_session.setIcon(qta.icon('fa5s.pencil-alt', color='white'))
+        self.btn_edit_session.setFixedWidth(40)
+        self.btn_edit_session.setVisible(False)
+        self.btn_edit_session.clicked.connect(self.unlock_session_fields)
 
         self.btn_conn = QPushButton()
         self.btn_conn.setIcon(qta.icon('fa5s.plug', color='white'))
@@ -365,13 +530,13 @@ class Interface(QMainWindow):
         self.btn_settings_menu.setFixedWidth(40)
         self.btn_settings_menu.clicked.connect(self._show_settings_menu)
 
-        for w in [self.logo_label, self.combo_sessions]:
+        for w in [self.logo_label, self.combo_sessions, self.btn_manage_sessions]:
             conn_layout.addWidget(w)
         conn_layout.addWidget(self.entry_host, 3)
         conn_layout.addWidget(self.entry_pass, 2)
         conn_layout.addWidget(self.btn_show_pass)
         conn_layout.addWidget(self.entry_key, 2)
-        for w in [btn_browse_key, self.btn_save, self.chk_x11, self.btn_conn,
+        for w in [btn_browse_key, self.btn_save, self.btn_edit_session, self.btn_more, self.chk_x11, self.btn_conn,
                   self.btn_new_tab, self.btn_tools_menu, self.btn_settings_menu]:
             conn_layout.addWidget(w)
 
@@ -379,6 +544,50 @@ class Interface(QMainWindow):
         self.tab_widget.setTabsClosable(True)
         self.tab_widget.tabCloseRequested.connect(self.close_tab)
         self.tab_widget.currentChanged.connect(self.on_tab_changed)
+
+    def _toggle_conn_row2(self, checked):
+        self.conn_row2.setVisible(checked and self._conn_compact)
+        self._update_conn_height()
+
+    def _update_conn_height(self):
+        h = 60 + (46 if self.conn_row2.isVisibleTo(self.conn_inner) else 0)
+        self.conn_inner.setMaximumHeight(h)
+        try:
+            if self._conn_scroll is not None:
+                self._conn_scroll.setFixedHeight(h + 16)
+        except RuntimeError:
+            self._conn_scroll = None
+
+    def _set_conn_compact(self, compact):
+        """Janela estreita: chave SSH e X11 saem da barra principal e ficam numa
+        2ª linha, aberta pelo botão '...'. Evita rolar a barra na horizontal."""
+        if compact == self._conn_compact:
+            return
+        self._conn_compact = compact
+        l1 = self.conn_row1.layout()
+        extras = (self.entry_key, self.btn_browse_key, self.chk_x11)
+        for w in extras:
+            l1.removeWidget(w)
+            self._row2_layout.removeWidget(w)
+        if compact:
+            self._row2_layout.addWidget(self.entry_key, 1)
+            self._row2_layout.addWidget(self.btn_browse_key)
+            self._row2_layout.addWidget(self.chk_x11)
+        else:
+            i = l1.indexOf(self.btn_show_pass) + 1
+            l1.insertWidget(i, self.entry_key, 2)
+            l1.insertWidget(i + 1, self.btn_browse_key)
+            l1.insertWidget(l1.indexOf(self.btn_edit_session) + 1, self.chk_x11)
+        for w in extras:
+            w.show()
+        self.btn_more.setVisible(compact)
+        self.conn_row2.setVisible(compact and self.btn_more.isChecked())
+        self._update_conn_height()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "btn_more"):
+            self._set_conn_compact(self.width() < 1150)
 
     def create_card(self):
         f = QFrame(); f.setObjectName("Card"); return f
@@ -415,7 +624,10 @@ class Interface(QMainWindow):
             cs.setFrameShape(QFrame.Shape.NoFrame)
             cs.setObjectName("ConnScrollArea")
             cs.setWidget(self.conn_inner)
-            cs.setMaximumHeight(66)
+            # Folga p/ a barra horizontal (6px) + conteúdo de 60px: com 66 o
+            # scrollbar aparecia/sumia em loop de layout (stack overflow).
+            self._conn_scroll = cs
+            cs.setFixedHeight(76)
             cs.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
             return cs
 
@@ -446,6 +658,7 @@ class Interface(QMainWindow):
             ml.addWidget(self.tab_widget, 1)
             self.setCentralWidget(main_widget)
 
+        self._update_conn_height()
         self.apply_theme()
 
         for i in range(self.tab_widget.count()):
@@ -470,21 +683,31 @@ class Interface(QMainWindow):
         if mode == "dark":
             bg = base_bg; card = "#1e161e"; fg = "#f8f8f2"; term_bg = "#0d0a0d"
             border = "transparent"; input_border = "#444"
-            btn_dis_bg = "#444444"; btn_dis_fg = "#888888"; hover_fg = bg
+            btn_dis_bg = "#444444"; btn_dis_fg = "#888888"
+            hover_bg = fg; hover_fg = bg
             divider_color = "#555555"
             term_color = thm.get("terminal_color", _DEFAULT_DARK_TERM_COLOR)
         else:
             bg = "#f0f2f6"; card = "#ffffff"; fg = "#000000"; term_bg = "#f5f5f5"
             border = "#cccccc"; input_border = "#cccccc"
-            btn_dis_bg = "#cccccc"; btn_dis_fg = "#888888"; hover_fg = "#ffffff"
+            btn_dis_bg = "#cccccc"; btn_dis_fg = "#888888"
+            # Hover no claro: tom mais escuro do accent (o antigo preto/branco
+            # deixava o botão ilegível ao passar o mouse)
+            hover_bg = QColor(accent).darker(125).name(); hover_fg = "#ffffff"
             divider_color = "#d0d0d0"
             stored_tc = thm.get("terminal_color", _DEFAULT_DARK_TERM_COLOR)
             term_color = "#2d3436" if stored_tc == _DEFAULT_DARK_TERM_COLOR else stored_tc
 
+        # Estilos retro têm fundo escuro próprio: o texto usa a cor de fósforo
+        # do estilo (senão, no modo claro, ficava cinza-escuro sobre preto).
         if term_style == "matrix":
-            term_font = "'Courier New', monospace"; term_weight = "bold"; term_bg_eff = "#000000"
+            term_font = "'Courier New', monospace"; term_weight = "bold"; term_bg_eff = "#000000"; term_color = "#00ff41"
         elif term_style == "retro":
-            term_font = "'VT100', 'Courier', monospace"; term_weight = "bold"; term_bg_eff = "#1a1a1a"
+            term_font = "'VT100', 'Courier', monospace"; term_weight = "bold"; term_bg_eff = "#1a1a1a"; term_color = "#ffb000"
+        elif term_style == "crt":
+            term_font = "'Courier New', monospace"; term_weight = "bold"; term_bg_eff = "#0a1206"; term_color = "#33ff33"
+        elif term_style == "crt_blue":
+            term_font = "'Courier New', monospace"; term_weight = "bold"; term_bg_eff = "#050d18"; term_color = "#4dc4ff"
         else:
             term_font = "'Consolas', 'Courier New', monospace"; term_weight = "normal"; term_bg_eff = term_bg
 
@@ -500,7 +723,7 @@ class Interface(QMainWindow):
         QComboBox::drop-down {{ border: none; }}
         QComboBox QAbstractItemView {{ background-color: {bg}; color: {fg}; selection-background-color: {accent}; selection-color: white; }}
         QPushButton {{ background-color: {accent}; color: white; border-radius: 6px; padding: 6px 14px; font-weight: bold; border: none; }}
-        QPushButton:hover {{ background-color: {fg}; color: {hover_fg}; }}
+        QPushButton:hover {{ background-color: {hover_bg}; color: {hover_fg}; }}
         QPushButton:disabled {{ background-color: {btn_dis_bg}; color: {btn_dis_fg}; }}
         QTreeWidget, QListWidget, QTableView {{ background-color: {bg}; alternate-background-color: {card}; color: {fg}; border: 1px solid {border}; border-radius: 8px; outline: none; padding: 5px; }}
         QTreeWidget::item, QListWidget::item {{ padding: 4px; border-radius: 4px; }}
@@ -514,9 +737,12 @@ class Interface(QMainWindow):
         QHeaderView::section {{ background-color: {card}; color: {fg}; padding: 6px; font-weight: bold; border: none; border-bottom: 1px solid {border}; }}
         QHeaderView::section:vertical {{ background-color: {card}; border: none; border-right: 1px solid {border}; padding: 4px; }}
         QTableView QHeaderView::section:vertical {{ background-color: {bg}; border: none; border-right: 1px solid {border}; color: {fg}; }}
-        QSplitter::handle {{ background-color: {border}; }}
-        QSplitter::handle:horizontal {{ width: 1px; }}
-        QSplitter::handle:vertical {{ height: 1px; }}
+        QSplitter::handle {{ background-color: {input_border}; margin: 0px; padding: 0px; }}
+        QSplitter::handle:hover, QSplitter::handle:pressed {{ background-color: {accent}; }}
+        QSplitter::handle:horizontal {{ width: 3px; }}
+        QSplitter::handle:vertical {{ height: 3px; }}
+        QMainWindow::separator {{ background-color: {input_border}; width: 3px; height: 3px; }}
+        QMainWindow::separator:hover {{ background-color: {accent}; }}
         QTabWidget::pane {{ border: 1px solid {border}; border-radius: 8px; background: {card}; }}
         QTabBar::tab {{ background: {bg}; color: {fg}; padding: 8px 16px; border: 1px solid {border}; border-top-left-radius: 4px; border-top-right-radius: 4px; }}
         QTabBar::tab:selected {{ background: {card}; color: {accent}; font-weight: bold; }}
@@ -551,19 +777,30 @@ class Interface(QMainWindow):
             w = self.tab_widget.widget(i)
             if isinstance(w, ConnectionTab):
                 w.refresh_transfer_panel_theme()
+                w.refresh_terminal_theme()
 
     def toggle_theme_mode(self):
         self.config_mgr.theme["mode"] = "light" if self.config_mgr.theme.get("mode") == "dark" else "dark"
         self.config_mgr.save_config(); self.apply_theme()
 
     def cycle_term_style(self):
-        styles = ["standard", "retro", "matrix"]
+        styles = TERM_STYLES
         cur    = self.config_mgr.theme.get("term_style", "standard")
-        nxt    = styles[(styles.index(cur) + 1) % 3] if cur in styles else "standard"
+        nxt    = styles[(styles.index(cur) + 1) % len(styles)] if cur in styles else "standard"
+        self.set_term_style(nxt)
+
+    def set_term_style(self, nxt):
+        if nxt not in TERM_STYLES:
+            return
         self.config_mgr.theme["term_style"] = nxt
         self.config_mgr.save_config(); self.apply_theme()
         lang = self.config_mgr.language
         if self.current_tab: self.current_tab.sig_log.emit(f"[{t('term_style', lang)}: {t(f'style_{nxt}', lang)}]")
+
+    def set_language(self, code):
+        if code in ("en", "pt", "es") and code != self.config_mgr.language:
+            self.config_mgr.language = code
+            self.config_mgr.save_config(); self.update_ui_texts()
 
     def toggle_language(self):
         langs = ["en", "pt", "es"]
@@ -588,6 +825,11 @@ class Interface(QMainWindow):
         self.config_mgr.theme["font_size"] = self.terminal_font_size
         self.config_mgr.save_config(); self.apply_theme()
 
+    def reset_font(self):
+        self.terminal_font_size = 13
+        self.config_mgr.theme["font_size"] = 13
+        self.config_mgr.save_config(); self.apply_theme()
+
     def decrease_font(self):
         if self.terminal_font_size > 6:
             self.terminal_font_size -= 1
@@ -596,7 +838,12 @@ class Interface(QMainWindow):
 
     def toggle_layout(self):
         cur = self.config_mgr.theme.get("layout", "classic")
-        self.config_mgr.theme["layout"] = "dock" if cur == "classic" else "classic"
+        self.set_layout("dock" if cur == "classic" else "classic")
+
+    def set_layout(self, layout):
+        if layout not in ("classic", "dock") or layout == self.config_mgr.theme.get("layout"):
+            return
+        self.config_mgr.theme["layout"] = layout
         self.config_mgr.save_config(); self.apply_layout()
 
     def update_ui_texts(self):
@@ -615,8 +862,11 @@ class Interface(QMainWindow):
         self.combo_sessions.setToolTip(t("tip_sessions_ctx", lang))
         self.btn_show_pass.setToolTip(t("tip_show_pass", lang))
         self.btn_save.setToolTip(t("tip_save_session", lang))
+        self.btn_edit_session.setToolTip(t("session_edit", lang))
+        self.btn_manage_sessions.setToolTip(t("sessions_manage", lang))
         self.btn_conn.setToolTip(t("tip_connect", lang))
-        self.btn_new_tab.setToolTip(t("add_tab", lang))
+        self.btn_new_tab.setToolTip(t("add_tab", lang) + "  (Ctrl+Shift+T)")
+        self.btn_more.setToolTip(t("more_options", lang))
         self.btn_tools_menu.setToolTip("Tools")
         self.btn_settings_menu.setToolTip("Settings")
         self.combo_sessions.setItemText(0, t("saved_sessions", lang))
@@ -638,6 +888,29 @@ class Interface(QMainWindow):
             tab.handle_connection(self.entry_host.text(), self.entry_pass.text(),
                                   self.entry_key.text(), self.chk_x11.isChecked())
 
+    def _set_session_locked(self, locked):
+        """Sessão salva carregada fica só-leitura: evita editar sem querer os
+        dados guardados e ficar com o combo apontando p/ um nome que já não
+        corresponde ao que está nos campos."""
+        for w in (self.entry_host, self.entry_key):
+            w.setReadOnly(locked)
+        # A senha só fica bloqueada se foi SALVA na sessão; se não foi, o
+        # usuário precisa poder digitá-la para entrar.
+        saved = self.config_mgr.sessions.get(self.combo_sessions.currentText(), {})
+        self.entry_pass.setReadOnly(locked and bool(saved.get("password")))
+        self.btn_edit_session.setVisible(locked)
+        lang = self.config_mgr.language
+        self.combo_sessions.setToolTip(
+            t("session_locked", lang) if locked else t("tip_sessions_ctx", lang))
+
+    def unlock_session_fields(self):
+        lang = self.config_mgr.language
+        if QMessageBox.question(
+                self, t("confirm", lang), t("session_edit_confirm", lang),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        ) == QMessageBox.StandardButton.Yes:
+            self._set_session_locked(False)
+
     def load_session(self, name):
         if name in self.config_mgr.sessions:
             data = self.config_mgr.sessions[name]
@@ -645,11 +918,23 @@ class Interface(QMainWindow):
             self.entry_key.setText(data.get("key", ""))
             pwd = decrypt_password(data.get("password", ""))
             self.entry_pass.setText(pwd)
+            self._set_session_locked(True)
+        else:
+            self._set_session_locked(False)
 
     def save_current_session(self):
         lang = self.config_mgr.language
-        name, ok = QInputDialog.getText(self, t("save", lang), t("session_name", lang))
+        current = self.combo_sessions.currentText()
+        default_name = current if current in self.config_mgr.sessions else ""
+        name, ok = QInputDialog.getText(self, t("save", lang), t("session_name", lang),
+                                        text=default_name)
+        name = name.strip() if name else name
         if ok and name:
+            if name in self.config_mgr.sessions and QMessageBox.question(
+                    self, t("save", lang), t("session_overwrite", lang).format(name=name),
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            ) != QMessageBox.StandardButton.Yes:
+                return
             save_pass = (
                 self.entry_pass.text() and
                 QMessageBox.question(
@@ -665,22 +950,115 @@ class Interface(QMainWindow):
             self.config_mgr.save_config()
             if self.combo_sessions.findText(name) == -1:
                 self.combo_sessions.addItem(name)
+            self.combo_sessions.blockSignals(True)
+            self.combo_sessions.setCurrentText(name)
+            self.combo_sessions.blockSignals(False)
+            self._set_session_locked(True)
 
     def show_session_menu(self, pos):
         lang    = self.config_mgr.language
         current = self.combo_sessions.currentText()
         if current == t("saved_sessions", lang) or current not in self.config_mgr.sessions: return
         menu = QMenu(self)
-        act  = QAction(qta.icon('fa5s.trash', color='#dc3545'), f"Delete: {current}", self)
+        act_ren = QAction(qta.icon('fa5s.pen', color=self._menu_icon_color()),
+                          f"{t('session_rename', lang)}: {current}", self)
+        act_ren.triggered.connect(lambda: self.rename_session(current))
+        act  = QAction(qta.icon('fa5s.trash', color='#dc3545'), f"{t('delete', lang)}: {current}", self)
         act.triggered.connect(lambda: self.delete_session(current))
+        menu.addAction(act_ren)
         menu.addAction(act)
         menu.exec(self.combo_sessions.mapToGlobal(pos))
 
-    def delete_session(self, name):
-        if name in self.config_mgr.sessions:
-            del self.config_mgr.sessions[name]; self.config_mgr.save_config()
-            idx = self.combo_sessions.findText(name)
-            if idx >= 0: self.combo_sessions.removeItem(idx)
+    def delete_session(self, name, confirm=True):
+        if name not in self.config_mgr.sessions:
+            return False
+        lang = self.config_mgr.language
+        if confirm and QMessageBox.question(
+                self, t("delete", lang), t("session_delete_confirm", lang).format(name=name),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+            return False
+        del self.config_mgr.sessions[name]; self.config_mgr.save_config()
+        idx = self.combo_sessions.findText(name)
+        if idx >= 0: self.combo_sessions.removeItem(idx)
+        self._set_session_locked(False)
+        return True
+
+    def rename_session(self, old):
+        """Renomeia uma sessão salva mantendo host/chave/senha e a ordem."""
+        sessions = self.config_mgr.sessions
+        if old not in sessions:
+            return None
+        lang = self.config_mgr.language
+        new, ok = QInputDialog.getText(self, t("session_rename", lang),
+                                       t("session_name", lang), text=old)
+        new = new.strip() if new else ""
+        if not ok or not new or new == old:
+            return None
+        if new in sessions:
+            QMessageBox.warning(self, t("session_rename", lang),
+                                t("session_exists", lang).format(name=new))
+            return None
+        self.config_mgr.sessions = {(new if k == old else k): v for k, v in sessions.items()}
+        self.config_mgr.save_config()
+        idx = self.combo_sessions.findText(old)
+        if idx >= 0:
+            self.combo_sessions.setItemText(idx, new)   # dispara load_session(new): ok
+        return new
+
+    def manage_sessions(self):
+        """Lista todas as sessões salvas com botões Renomear / Excluir."""
+        from PyQt6.QtWidgets import QListWidget
+        lang = self.config_mgr.language
+        dlg = QDialog(self)
+        dlg.setWindowTitle(t("sessions_manage", lang))
+        dlg.resize(420, 340)
+        lay = QVBoxLayout(dlg)
+        lst = QListWidget()
+        lay.addWidget(lst)
+
+        def refill(select=None):
+            lst.clear()
+            for name, data in self.config_mgr.sessions.items():
+                lst.addItem(f"{name}   \u2014   {data.get('host', '')}")
+                lst.item(lst.count() - 1).setData(Qt.ItemDataRole.UserRole, name)
+            for i in range(lst.count()):
+                if lst.item(i).data(Qt.ItemDataRole.UserRole) == select:
+                    lst.setCurrentRow(i)
+
+        def current_name():
+            it = lst.currentItem()
+            return it.data(Qt.ItemDataRole.UserRole) if it else None
+
+        def do_rename():
+            old = current_name()
+            if old:
+                new = self.rename_session(old)
+                if new:
+                    refill(new)
+
+        def do_delete():
+            name = current_name()
+            if name and self.delete_session(name):
+                refill()
+
+        row = QHBoxLayout()
+        b_ren = QPushButton(t("session_rename", lang))
+        b_ren.setIcon(qta.icon('fa5s.pen', color='white'))
+        b_ren.clicked.connect(do_rename)
+        b_del = QPushButton(t("delete", lang))
+        b_del.setIcon(qta.icon('fa5s.trash', color='white'))
+        b_del.clicked.connect(do_delete)
+        row.addWidget(b_ren)
+        row.addWidget(b_del)
+        row.addStretch()
+        lay.addLayout(row)
+        lst.itemDoubleClicked.connect(lambda _i: do_rename())
+        box = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        box.rejected.connect(dlg.reject)
+        lay.addWidget(box)
+        refill(self.combo_sessions.currentText())
+        dlg.exec()
 
     def browse_ssh_key(self):
         lang = self.config_mgr.language

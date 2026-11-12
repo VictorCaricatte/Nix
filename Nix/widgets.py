@@ -1,8 +1,36 @@
 import sys
 import os
 from PyQt6.QtWidgets import QTreeWidget
-from PyQt6.QtCore import pyqtSignal, QUrl
+from PyQt6.QtCore import pyqtSignal, QUrl, QObject, QTimer
 from PyQt6.QtGui import QDragEnterEvent, QDropEvent
+
+class _GuiInvoker(QObject):
+    """Vive na thread da GUI e executa callables enviados por QUALQUER thread.
+
+    QTimer.singleShot chamado de uma thread Python comum não dispara (e imprime
+    "QBasicTimer can only be used with threads started with QThread"); o sinal
+    abaixo é enfileirado para a thread da GUI, onde o timer funciona.
+    """
+    _sig = pyqtSignal(int, object)
+
+    def __init__(self):
+        super().__init__()
+        self._sig.connect(self._run)
+
+    def _run(self, delay, fn):
+        if delay > 0:
+            QTimer.singleShot(delay, fn)
+        else:
+            fn()
+
+
+_invoker = _GuiInvoker()
+
+
+def gui_single_shot(ms, fn):
+    """Mesma assinatura de QTimer.singleShot, mas seguro para chamar de threads."""
+    _invoker._sig.emit(int(ms), fn)
+
 
 class ExplorerTree(QTreeWidget):
     files_dropped = pyqtSignal(list)

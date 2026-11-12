@@ -7,9 +7,12 @@ import os
 import stat
 import posixpath
 import re
+import secrets
+import socket
 import time
 import tempfile
 import threading
+import codecs
 
 import qtawesome as qta
 from PyQt6.QtWidgets import (
@@ -24,10 +27,11 @@ from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QEvent, QMimeData, QUrl
 from PyQt6.QtGui import QAction, QDrag, QBrush, QColor
 
 from config import ConfigManager
-from ssh import SSHManager
+from ssh import SSHManager, SudoAuthError, SudoPasswordRequired, parse_host_string
 import backend
 from i18n import t
-from widgets import ExplorerTree
+from widgets import ExplorerTree, gui_single_shot
+from terminal import PyteTerminal
 from dialogs import (
     RemoteEditorDialog, ImageViewerDialog, TextViewerDialog,
     ScreensManagerDialog, EnvManagerDialog, TableViewerDialog,
@@ -35,6 +39,8 @@ from dialogs import (
 )
 
 class InteractiveTerminal(QPlainTextEdit):
+    """LEGADO: substituído pelo PyteTerminal (terminal.py). Mantido apenas
+    para compatibilidade de import (frontend.py)."""
     def __init__(self, parent_tab=None):
         super().__init__()
         self.parent_tab = parent_tab
@@ -54,6 +60,8 @@ class InteractiveTerminal(QPlainTextEdit):
 
 class ConnectionTab(QWidget):
     sig_log            = pyqtSignal(str)
+    sig_term_data      = pyqtSignal(str)   # bytes crus (decodificados) do shell -> terminal
+    sig_pty_sync       = pyqtSignal()      # pós-conexão: sincroniza tamanho do PTY
     sig_monitor        = pyqtSignal(float, float, list, dict, list, dict)
     sig_os_info        = pyqtSignal(str)
     sig_explorer       = pyqtSignal()
@@ -63,12 +71,25 @@ class ConnectionTab(QWidget):
     sig_table_viewer   = pyqtSignal(str, str, object)
     sig_msg            = pyqtSignal(str, str, str)
     sig_env_list       = pyqtSignal(object, str, list)
-    sig_ask_sudo       = pyqtSignal(list, object)
-    sig_transfer_progress = pyqtSignal(int, int, str)
+    # Container de resultado tipado como `object` (não `list`): em conexão
+    # cross-thread o PyQt COPIA argumentos tipados `list`, então o valor
+    # preenchido no slot não voltava para a thread que espera (senha/decisão
+    # eram perdidas). Com `object` a mesma referência é preservada.
+    sig_ask_sudo       = pyqtSignal(object, object)
+    sig_ask_hostkey    = pyqtSignal(str, str, str, object, object)
+    # object (não int): int do PyQt é 32 bits e estourava em arquivos > 2 GB
+    sig_transfer_progress = pyqtSignal(object, object, str)
     sig_transfer_done  = pyqtSignal(str)
+    sig_transfer_failed = pyqtSignal(str, str)   # (tid, "failed" | "cancelled")
+    sig_conn_lost      = pyqtSignal(str)         # "lost" | "closed"
+    sig_conn_state     = pyqtSignal(object, str)  # (tab, connected|connecting|lost|idle)
+    sig_latency        = pyqtSignal(int)
+    sig_lost_banner    = pyqtSignal(str)
+    sig_completion     = pyqtSignal(object)
     sig_screen_status  = pyqtSignal(bool, str)
+    sig_shell_report   = pyqtSignal(object)      # (token, usuário, host, sty, pasta)
 
-    sig_conn_update    = pyqtSignal(object, bool, str)
+    sig_conn_update   = pyqtSignal(object, bool, str)
     sig_tab_title      = pyqtSignal(object, str)
     sig_notify         = pyqtSignal(str, str)
     sig_svc_rows       = pyqtSignal(list)
@@ -96,8 +117,29 @@ class ConnectionTab(QWidget):
         self._port_all_rows = []
         self._port_auto_timer = QTimer()
         self._port_auto_timer.timeout.connect(self._refresh_ports_tab)
+        self._last_conn = None        # (host_str, senha, chave, x11) p/ reconectar
+        self._resume_path = None      # diretório a restaurar após reconectar
+        self._home_path = ""
+        self._monitor_visible = True  # lido pela thread do monitor
+        self._monitor_flag_timer = QTimer(self)
+        self._monitor_flag_timer.timeout.connect(self._update_monitor_flag)
+        self._monitor_flag_timer.start(1000)
+        # Terminal sem atividade por um instante: hora de olhar a linha do cursor
+        self._quiet_timer = QTimer(self)
+        self._quiet_timer.setSingleShot(True)
+        self._quiet_timer.setInterval(300)
+        self._quiet_timer.timeout.connect(self._on_terminal_quiet)
+        self._sync_lock = threading.Lock()
+        self._sync_busy = False
+        self._sudo_typed = []         # senha sendo digitada num prompt do sudo
+        self._remote_uname = ""
+        self._login_shell = ""
+        self._reset_shell_tracking()
 
+        self.sig_shell_report.connect(self._on_shell_report)
         self.sig_log.connect(self.log_local_slot)
+        self.sig_term_data.connect(self._feed_terminal_slot)
+        self.sig_pty_sync.connect(self._sync_pty_slot)
         self.sig_monitor.connect(self.update_monitor_ui_slot)
         self.sig_os_info.connect(self.update_os_info_slot)
         self.sig_explorer.connect(self.update_explorer_slot)
@@ -108,8 +150,14 @@ class ConnectionTab(QWidget):
         self.sig_msg.connect(self.show_msg_slot)
         self.sig_env_list.connect(self.update_env_list_slot)
         self.sig_ask_sudo.connect(self.ask_sudo_slot)
+        self.sig_ask_hostkey.connect(self.ask_hostkey_slot)
         self.sig_transfer_progress.connect(self.update_progress_slot)
         self.sig_transfer_done.connect(self._remove_transfer_row)
+        self.sig_transfer_failed.connect(self._mark_transfer_failed)
+        self.sig_conn_lost.connect(self._on_connection_lost)
+        self.sig_latency.connect(self._update_latency)
+        self.sig_lost_banner.connect(self._show_lost_banner)
+        self.sig_completion.connect(self._apply_completion)
         self.sig_screen_status.connect(self.set_screen_status)
         self.sig_svc_rows.connect(self._populate_services_tab)
         self.sig_port_rows.connect(self._populate_ports_tab)
@@ -118,18 +166,63 @@ class ConnectionTab(QWidget):
         self._git_branch = ""
         self._build_panels()
 
+    @staticmethod
+    def _shrinkable_row(row_layout):
+        """Põe uma barra de botões numa área com rolagem horizontal: sem isso a
+        soma dos botões impõe largura mínima e o splitter não deixa o painel
+        encolher em telas pequenas (agora o excedente rola em vez de travar)."""
+        inner = QWidget()
+        inner.setLayout(row_layout)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        area = QScrollArea()
+        area.setFrameShape(QFrame.Shape.NoFrame)
+        area.setWidgetResizable(True)
+        area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        area.setWidget(inner)
+        area.setFixedHeight(inner.sizeHint().height() + 10)
+        area.setStyleSheet("QScrollArea { background: transparent; } "
+                           "QScrollArea > QWidget > QWidget { background: transparent; }")
+        return area
+
     def _build_panels(self):
         lang = self.config_mgr.language
         root_layout = QVBoxLayout(self)
         root_layout.setContentsMargins(0, 0, 0, 0)
 
+        # Aviso de conexão perdida (escondido até acontecer)
+        self.lost_banner = QFrame()
+        self.lost_banner.setObjectName("LostBanner")
+        self.lost_banner.setStyleSheet(
+            "QFrame#LostBanner { background-color: #b3261e; border-radius: 8px; }"
+            "QFrame#LostBanner QLabel { color: white; font-weight: bold; background: transparent; }"
+            "QFrame#LostBanner QPushButton { background-color: white; color: #b3261e; }"
+            "QFrame#LostBanner QPushButton:hover { background-color: #ffd9d6; color: #b3261e; }")
+        lb = QHBoxLayout(self.lost_banner)
+        lb.setContentsMargins(12, 6, 8, 6)
+        self.lbl_lost = QLabel()
+        self.btn_reconnect = QPushButton()
+        self.btn_reconnect.setIcon(qta.icon('fa5s.sync-alt', color='#b3261e'))
+        self.btn_reconnect.clicked.connect(self.reconnect)
+        btn_lost_close = QPushButton()
+        btn_lost_close.setIcon(qta.icon('fa5s.times', color='#b3261e'))
+        btn_lost_close.setFixedWidth(34)
+        btn_lost_close.clicked.connect(self.lost_banner.hide)
+        lb.addWidget(self.lbl_lost, 1)
+        lb.addWidget(self.btn_reconnect)
+        lb.addWidget(btn_lost_close)
+        self.lost_banner.hide()
+        root_layout.addWidget(self.lost_banner)
+
         h_splitter = QSplitter(Qt.Orientation.Horizontal)
         h_splitter.setChildrenCollapsible(False)
+        h_splitter.setHandleWidth(4)
         self._h_splitter = h_splitter
 
         v_splitter = QSplitter(Qt.Orientation.Vertical)
         v_splitter.setOpaqueResize(True)
         v_splitter.setChildrenCollapsible(False)
+        v_splitter.setHandleWidth(4)
         self._v_splitter = v_splitter
 
         self.exp_inner = QFrame()
@@ -192,7 +285,7 @@ class ConnectionTab(QWidget):
                 path_layout.addWidget(w, 1)
             else:
                 path_layout.addWidget(w)
-        exp_layout.addLayout(path_layout)
+        exp_layout.addWidget(self._shrinkable_row(path_layout))
 
         search_layout = QHBoxLayout()
         self.filter_input = QLineEdit()
@@ -284,13 +377,21 @@ class ConnectionTab(QWidget):
         for w in [self.lbl_term, self.btn_font_down, self.btn_font_up, self.btn_auto_scroll]:
             top_term.addWidget(w)
         top_term.addStretch()
+        self.btn_toggle_monitor = QPushButton()
+        self.btn_toggle_monitor.setIcon(qta.icon('fa5s.chart-line', color='white'))
+        self.btn_toggle_monitor.setCheckable(True)
+        self.btn_toggle_monitor.setToolTip("Monitor  (Ctrl+Shift+M)")
+        self.btn_toggle_monitor.toggled.connect(self.set_monitor_hidden)
+        top_term.addWidget(self.btn_toggle_monitor)
+        self.lbl_latency = QLabel()
+        self.lbl_latency.setVisible(False)
+        top_term.addWidget(self.lbl_latency)
         top_term.addWidget(self.lbl_screen_status)
-        term_layout.addLayout(top_term)
+        term_layout.addWidget(self._shrinkable_row(top_term))
 
-        self.output = InteractiveTerminal(self)
-        self.output.setReadOnly(True)
-        self.output.setMaximumBlockCount(5000)
+        self.output = PyteTerminal(self)
         term_layout.addWidget(self.output)
+        self.refresh_terminal_theme()
 
         input_layout = QHBoxLayout()
         lbl_prompt = QLabel("❯")
@@ -562,6 +663,7 @@ class ConnectionTab(QWidget):
             ("File Sync",      'fa5s.exchange-alt',     lambda: FileSyncDialog(self, self.ssh_mgr, self.remote_path, lang).exec()),
             ("SSH Key Mgr",    'fa5s.key',              lambda: SSHKeyManagerDialog(self, self.ssh_mgr, lang).exec()),
             ("Service Mgr",    'fa5s.server',           self._open_service_manager),
+            ("Containers",     'fa5b.docker',           self._open_container_manager),
             ("Port Monitor",   'fa5s.project-diagram',  self._open_port_monitor),
             ("Package Mgr",    'fa5s.box-open',         lambda: PackageManagerDialog(self, self.ssh_mgr, lang).exec()),
             ("Users & Groups", 'fa5s.users-cog',        lambda: UserManagerDialog(self, self.ssh_mgr, lang, self._has_sudo or self._conn_user == "root").exec()),
@@ -589,7 +691,14 @@ class ConnectionTab(QWidget):
         from devops_dialogs import PortMonitorDialog
         PortMonitorDialog(self, self.ssh_mgr, self.config_mgr.language).exec()
 
+    def _open_container_manager(self):
+        if not self.ssh_mgr.is_connected:
+            self.sig_msg.emit("warn", "DevOps", "Not connected."); return
+        from devops_dialogs import ContainerManagerDialog
+        ContainerManagerDialog(self, self.ssh_mgr, self.config_mgr.language).exec()
+
     def _on_sys_tab_changed(self, idx):
+        self._update_monitor_flag()
         if idx == 3:
             self._load_quick_services()
         elif idx == 4:
@@ -603,9 +712,9 @@ class ConnectionTab(QWidget):
     def _fetch_quick_services(self):
         try:
             _, o1, _ = self.ssh_mgr.execute(
-                "systemctl list-units --type=service --all --no-pager --no-legend 2>/dev/null | head -300")
+                "systemctl list-units --type=service --all --no-pager --no-legend 2>/dev/null | head -300", timeout=15)
             _, o2, _ = self.ssh_mgr.execute(
-                "systemctl list-unit-files --type=service --no-pager --no-legend 2>/dev/null | head -300")
+                "systemctl list-unit-files --type=service --no-pager --no-legend 2>/dev/null | head -300", timeout=15)
             enabled_map = {}
             for ln in o2.read().decode().splitlines():
                 parts = ln.split()
@@ -673,7 +782,8 @@ class ConnectionTab(QWidget):
         if not self.ssh_mgr.is_connected: return
         def run():
             try:
-                _, out, err = self.ssh_mgr.execute(f"sudo -n systemctl {action} {svc} 2>&1")
+                _, out, err = self.ssh_mgr.execute(
+                    f"sudo -n systemctl {backend.sh_quote(action)} {backend.sh_quote(svc)} 2>&1")
                 result = (out.read() + err.read()).decode('utf-8', errors='replace').strip()
                 msg = f"systemctl {action} {svc}" + (f"\n{result}" if result else " — OK")
                 self.sig_log.emit(f"[DevOps] {msg}")
@@ -689,7 +799,7 @@ class ConnectionTab(QWidget):
 
     def _fetch_ports_quick(self):
         try:
-            _, out, _ = self.ssh_mgr.execute("ss -tulpn 2>/dev/null || netstat -tulpn 2>/dev/null")
+            _, out, _ = self.ssh_mgr.execute("ss -tulpn 2>/dev/null || netstat -tulpn 2>/dev/null", timeout=15)
             rows = []
             for line in out.read().decode().splitlines()[1:]:
                 parts = line.split()
@@ -739,10 +849,11 @@ class ConnectionTab(QWidget):
     def _fetch_git_status(self):
         """Runs async; emits via QTimer to update explorer colors and branch label."""
         try:
-            cmd = (f'git -C "{self.remote_path}" rev-parse --abbrev-ref HEAD 2>/dev/null'
+            rp = backend.sh_quote(self.remote_path)
+            cmd = (f'git -C {rp} rev-parse --abbrev-ref HEAD 2>/dev/null'
                    f' && echo "==STATUS=="'
-                   f' && git -C "{self.remote_path}" status --porcelain 2>/dev/null')
-            _, out, _ = self.ssh_mgr.execute(cmd)
+                   f' && git -C {rp} status --porcelain 2>/dev/null')
+            _, out, _ = self.ssh_mgr.execute(cmd, timeout=15)
             text = out.read().decode()
             if "==STATUS==" not in text:
                 return
@@ -754,7 +865,7 @@ class ConnectionTab(QWidget):
                     xy   = line[:2]
                     name = line[3:].strip().split(" -> ")[-1]
                     git_map[name.split("/")[0]] = xy
-            QTimer.singleShot(0, lambda b=branch, m=git_map: self._apply_git_colors(b, m))
+            gui_single_shot(0, lambda b=branch, m=git_map: self._apply_git_colors(b, m))
         except Exception:
             pass
 
@@ -781,7 +892,7 @@ class ConnectionTab(QWidget):
 
     def _run_git_cmd(self, cmd):
         if not self.ssh_mgr.is_connected: return
-        self.cmd_input.setText(f'cd "{self.remote_path}" && {cmd}')
+        self.cmd_input.setText(f'cd {backend.sh_quote(self.remote_path)} && {cmd}')
         self.send_command()
 
     def update_texts(self, lang):
@@ -796,8 +907,8 @@ class ConnectionTab(QWidget):
         self.btn_down.setToolTip(t("tip_download", lang));   self.btn_down.setText(t("down_file", lang))
         self.btn_search.setToolTip(t("tip_deep_search", lang))
         self.lbl_term.setText(f" {t('terminal', lang)}")
-        self.btn_font_up.setToolTip(t("tip_font_up", lang))
-        self.btn_font_down.setToolTip(t("tip_font_down", lang))
+        self.btn_font_up.setToolTip(t("tip_font_up", lang) + "  (Ctrl +)")
+        self.btn_font_down.setToolTip(t("tip_font_down", lang) + "  (Ctrl -)")
         self.btn_auto_scroll.setToolTip(t("tip_scroll_on", lang) if self.auto_scroll else t("tip_scroll_off", lang))
         self.btn_clear.setText(t("clear_local", lang));  self.btn_clear.setToolTip(t("tip_clear", lang))
         self.btn_force.setText(t("force_main", lang));   self.btn_force.setToolTip(t("tip_force_main", lang))
@@ -816,6 +927,9 @@ class ConnectionTab(QWidget):
         self.btn_run_snip.setText(t("run_snippet", lang))
         self.explorer.setHeaderLabels([t("name", lang), t("size", lang), t("type", lang), t("permissions", lang), "Progress"])
         self.explorer.setColumnWidth(4, 120)
+        for i in range(self.explorer.topLevelItemCount()):   # re-traduz a coluna "Tipo"
+            it = self.explorer.topLevelItem(i)
+            it.setText(2, t("directory" if self._item_kind(it) == "Directory" else "file", lang))
         self.sys_tabs.setTabText(0, t("sys_mon", lang))
         self.sys_tabs.setTabText(1, t("os_info", lang))
         if self.sys_tabs.count() > 2:
@@ -832,43 +946,229 @@ class ConnectionTab(QWidget):
     def handle_connection(self, host_str, password, key, x11):
         lang = self.config_mgr.language
         if not self.ssh_mgr.is_connected:
+            self._last_conn = (host_str, password, key, x11)
+            self.lost_banner.hide()
             self.sig_conn_update.emit(self, False, t("connecting", lang))
+            self.sig_conn_state.emit(self, "connecting")
             threading.Thread(target=self.connect_ssh,
                              args=(host_str, password, key, x11), daemon=True).start()
         else:
+            self._resume_path = None
             self.ssh_mgr.disconnect()
-            self._conn_host = ""
-            self._conn_user = ""
-            self._has_sudo  = False
+            self._reset_after_disconnect()
             self.sig_conn_update.emit(self, True, t("connect", lang))
             self.sig_tab_title.emit(self, t("new_tab", lang))
+            self.sig_conn_state.emit(self, "idle")
+
+    def _reset_after_disconnect(self):
+        self._conn_host = ""
+        self._conn_user = ""
+        self._has_sudo  = False
+        # Não deixa a senha do sudo na memória após desconectar — senão ela
+        # persistiria e seria reusada ao conectar em OUTRO servidor.
+        self.sudo_cache[0] = None
+        self._sudo_typed.clear()
+        self._quiet_timer.stop()
+        self._reset_shell_tracking()
+        self.cmd_input.setEchoMode(QLineEdit.EchoMode.Normal)
+        self.lbl_latency.setVisible(False)
+
+    # ------------------------------------------------------------------ #
+    #  Conexão perdida / reconexão                                        #
+    # ------------------------------------------------------------------ #
+    def _on_connection_lost(self, reason):
+        """Slot (thread da GUI): a conexão caiu sem o usuário pedir. Avisa no
+        banner, no terminal, na aba e na bandeja do sistema."""
+        if not self.ssh_mgr.is_connected:
+            return  # já tratado (várias threads podem detectar a mesma queda)
+        lang = self.config_mgr.language
+        host = f"{self._conn_user}@{self._conn_host}"
+        self._resume_path = self.remote_path
+        try:
+            self.ssh_mgr.disconnect()
+        except Exception:
+            pass
+        self._reset_after_disconnect()
+        self._conn_host = host.split("@", 1)[1]
+        self._conn_user = host.split("@", 1)[0]
+        key = "conn_closed_msg" if reason == "closed" else "conn_lost_msg"
+        msg = t(key, lang).format(host=host)
+        self._show_lost_banner(msg)
+        self.sig_log.emit(f"[{msg}]")
+        self.sig_conn_update.emit(self, True, t("connect", lang))
+        self.sig_tab_title.emit(self, f"⚠ {host}")
+        self.sig_conn_state.emit(self, "lost")
+        self.sig_notify.emit(t("conn_lost_title", lang), msg)
+
+    def _show_lost_banner(self, msg):
+        lang = self.config_mgr.language
+        self.lbl_lost.setText(f"⚠  {msg}")
+        self.btn_reconnect.setText(t("reconnect", lang))
+        self.btn_reconnect.setEnabled(self._last_conn is not None)
+        self.lost_banner.show()
+
+    def reconnect(self):
+        """Reconecta com os mesmos dados da última conexão e volta ao diretório."""
+        if self._last_conn is None or self.ssh_mgr.is_connected:
+            return
+        lang = self.config_mgr.language
+        self.btn_reconnect.setEnabled(False)
+        self.btn_reconnect.setText(t("reconnecting", lang))
+        self.handle_connection(*self._last_conn)
+
+    def _update_latency(self, ms):
+        if not self.ssh_mgr.is_connected:
+            return
+        color = "#28a745" if ms < 100 else ("#ffb000" if ms < 300 else "#dc3545")
+        self.lbl_latency.setText(f"● {ms} ms")
+        self.lbl_latency.setStyleSheet(f"color: {color};")
+        self.lbl_latency.setToolTip(t("latency", self.config_mgr.language))
+        self.lbl_latency.setVisible(True)
+
+    def _watchdog_loop(self, transport):
+        """Detecta quedas silenciosas (cabo/Wi-Fi) e mede a latência: a cada 5s
+        abre um canal mínimo. 2 falhas seguidas (ou transporte morto) = perdida."""
+        mgr = self.ssh_mgr
+        fails = 0
+
+        def same_conn():
+            return (mgr.is_connected and mgr.client is not None
+                    and mgr.client.get_transport() is transport)
+
+        while same_conn():
+            ok = measured = False
+            t0 = time.time()
+            try:
+                if transport.is_active():
+                    _, stdout, _ = mgr.execute("true", timeout=6)
+                    stdout.read()
+                    ok = measured = True
+            except (OSError, EOFError):
+                ok = False      # timeout / socket caído: sem resposta do servidor
+            except Exception:
+                # O servidor RESPONDEU mas recusou o canal (ex.: MaxSessions
+                # cheio): a conexão está viva, só não dá para medir a latência.
+                ok = True
+            if ok:
+                fails = 0
+                if measured:
+                    self.sig_latency.emit(int((time.time() - t0) * 1000))
+            else:
+                fails += 1
+            if not transport.is_active() or fails >= 2:
+                if same_conn():
+                    self.sig_conn_lost.emit("lost")
+                return
+            for _ in range(10):
+                if not same_conn():
+                    return
+                time.sleep(0.5)
+
+    def toggle_monitor_panel(self):
+        self.btn_toggle_monitor.setChecked(not self.btn_toggle_monitor.isChecked())
+
+    def set_monitor_hidden(self, hidden):
+        """Minimiza (oculta) o painel lateral de monitoramento; o espaço vai
+        para o terminal/explorador e o monitor para de consultar o servidor."""
+        self.sys_inner.setVisible(not hidden)
+        self._update_monitor_flag()
+
+    def _update_monitor_flag(self):
+        """Roda na thread da GUI: o monitor só consulta o servidor quando o
+        painel de monitoramento está realmente visível."""
+        try:
+            win = self.window()
+            self._monitor_visible = bool(
+                self.isVisible() and not win.isMinimized()
+                and self.sys_inner.isVisibleTo(self)
+                and self.sys_tabs.currentIndex() == 0)
+        except RuntimeError:
+            self._monitor_visible = False
+
+    def _confirm_host_key(self, hostname, keytype, fingerprint):
+        """Callback chamado pela thread de conexão: pergunta na GUI e bloqueia
+        até o usuário responder (mesmo padrão do pedido de senha sudo)."""
+        import threading as _th
+        result = [False]
+        event = _th.Event()
+        self.sig_ask_hostkey.emit(hostname, keytype, fingerprint, result, event)
+        event.wait()
+        return result[0]
 
     def connect_ssh(self, host_str, password, key, x11):
         lang = self.config_mgr.language
+        # Toda nova conexão começa sem senha de sudo em cache — cobre o caso de
+        # a conexão anterior ter caído (sem passar pelo disconnect) e o usuário
+        # reconectar a OUTRO servidor.
+        self.sudo_cache[0] = None
         try:
-            u, h = host_str.split("@") if "@" in host_str else ("user", host_str)
-            self.ssh_mgr.connect(h, u, password=password, key_filename=key, use_x11=x11)
+            u, h, port = parse_host_string(host_str)
+            self.ssh_mgr.connect(h, u, password=password, key_filename=key,
+                                 use_x11=x11, port=port,
+                                 host_key_callback=self._confirm_host_key)
+            self._reset_shell_tracking()
+            self._remote_uname = self._login_shell = ""
             try:
-                _, stdout, _ = self.ssh_mgr.execute("pwd")
-                real_home = stdout.read().decode().strip()
-                if real_home: self.remote_path = real_home
+                _, stdout, _ = self.ssh_mgr.execute('pwd; uname -n; printf "%s\\n" "$SHELL"')
+                lines = stdout.read().decode().splitlines()
+                if lines and lines[0].strip(): self.remote_path = lines[0].strip()
+                if len(lines) >= 3:
+                    self._remote_uname = lines[1].strip()
+                    self._login_shell = posixpath.basename(lines[2].strip())
             except Exception:
                 pass
             self._conn_host = h
             self._conn_user = u
+            self._home_path = self.remote_path
+            resume, self._resume_path = self._resume_path, None
+            # Instala o hook no shell de login assim que o prompt aparecer
+            self._hook_armed = True
+            self._hook_initial = self._login_shell in ("bash", "zsh")
             threading.Thread(target=self.terminal_read_loop, daemon=True).start()
+            threading.Thread(target=self._watchdog_loop,
+                             args=(self.ssh_mgr.client.get_transport(),), daemon=True).start()
+            self.sig_pty_sync.emit()  # ajusta o PTY ao tamanho real do widget
             threading.Thread(target=self.monitor_loop, daemon=True).start()
             threading.Thread(target=self.fetch_os_thread, daemon=True).start()
             threading.Thread(target=self._check_sudo_access, daemon=True).start()
             self.sig_conn_update.emit(self, True, t("disconnect", lang))
             self.sig_tab_title.emit(self, f"{u}@{h}")
-            self.sig_notify.emit("Nix", f"Connected: {u}@{h}")
+            self.sig_conn_state.emit(self, "connected")
+            if resume:
+                self.sig_notify.emit("Nix", t("conn_restored", lang))
+            else:
+                self.sig_notify.emit("Nix", f"Connected: {u}@{h}")
             time.sleep(1)
+            if resume:
+                # Volta ao diretório em que o usuário estava antes da queda
+                try:
+                    with self.ssh_mgr.lock:
+                        self.ssh_mgr.sftp.chdir(resume)
+                        self.remote_path = self.ssh_mgr.sftp.getcwd() or resume
+                    self.ssh_mgr.shell.send("cd " + backend.sh_quote(resume) + " && clear\r")
+                except Exception:
+                    pass
             self.sig_explorer.emit()
         except Exception as e:
+            import paramiko
             self.sig_conn_update.emit(self, True, t("connect", lang))
-            error_msg = str(e) if str(e) else "Could not connect. Check credentials and network."
-            self.sig_msg.emit("error", t("error", lang), f"Connection Error:\n{error_msg}")
+            if self._resume_path is not None:
+                # Falhou uma RECONEXÃO: mantém o aviso vermelho com o botão
+                self.sig_conn_state.emit(self, "lost")
+                self.sig_lost_banner.emit(t("conn_lost_msg", lang).format(
+                    host=f"{self._conn_user}@{self._conn_host}"))
+            else:
+                self.sig_conn_state.emit(self, "idle")
+            if isinstance(e, paramiko.BadHostKeyException):
+                # Host conhecido, mas a chave MUDOU: possível MITM ativo.
+                self.sig_msg.emit(
+                    "error", t("hostkey_title", lang),
+                    f"{t('hostkey_changed', lang)}\n\nHost: {getattr(e, 'hostname', '')}")
+            else:
+                error_msg = str(e) if str(e) else "Could not connect. Check credentials and network."
+                if isinstance(e, OSError) or "Unable to connect" in error_msg:
+                    error_msg += "\n\n" + t("port_hint", lang)
+                self.sig_msg.emit("error", t("error", lang), f"Connection Error:\n{error_msg}")
 
     def _check_sudo_access(self):
         """Verifica se o usuário conectado é root ou pertence ao grupo sudo/wheel."""
@@ -876,58 +1176,319 @@ class ConnectionTab(QWidget):
             if self._conn_user == "root":
                 self._has_sudo = True
                 return
-            _, stdout, _ = self.ssh_mgr.execute("groups 2>/dev/null")
+            _, stdout, _ = self.ssh_mgr.execute("groups 2>/dev/null", timeout=10)
             groups = stdout.read().decode().strip().split()
             self._has_sudo = any(g in groups for g in ("sudo", "wheel", "root", "admin", "sudoers"))
         except Exception:
             self._has_sudo = False
 
     def terminal_read_loop(self):
+        """Lê o shell e alimenta o terminal real (pyte) com os bytes crus.
+
+        Usa recv com timeout (sem busy-poll) e um decoder UTF-8 incremental
+        para não quebrar caracteres multi-byte divididos entre chunks.
+        """
         ansi = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
-        while self.ssh_mgr.is_connected:
-            if self.ssh_mgr.shell and self.ssh_mgr.shell.recv_ready():
-                try:
-                    data = self.ssh_mgr.shell.recv(4096).decode('utf-8', errors='replace')
-                    if data:
-                        clean = ansi.sub('', data).replace('\r\n', '\n').replace('\r', '')
-                        if "[detached from" in clean.lower() or "[screen is terminating]" in clean.lower():
-                            self.sig_screen_status.emit(False, "")
-                        self.sig_log.emit(clean.strip('\n'))
-                except Exception:
-                    break
-            time.sleep(0.01)
+        decoder = codecs.getincrementaldecoder('utf-8')('replace')
+        shell = self.ssh_mgr.shell
+        try:
+            shell.settimeout(0.1)
+        except Exception:
+            pass
+        reason = "lost"
+        pending = ""
+        while self.ssh_mgr.is_connected and self.ssh_mgr.shell is shell:
+            try:
+                data = shell.recv(8192)
+            except socket.timeout:
+                continue
+            except Exception:
+                break
+            if not data:
+                reason = "closed"
+                break  # EOF: canal fechado pelo servidor
+            text = decoder.decode(data)
+            if not text:
+                continue
+            text, reports, pending = backend.extract_shell_reports(pending + text)
+            if text:
+                clean = ansi.sub('', text).lower()
+                if "[detached from" in clean or "[screen is terminating]" in clean:
+                    self.sig_screen_status.emit(False, "")
+                self.sig_term_data.emit(text)
+            for report in reports:
+                self.sig_shell_report.emit(report)
+        # Saiu do loop sem o usuário ter pedido para desconectar (is_connected
+        # continua True e o shell é o MESMO desta thread): a sessão caiu.
+        if self.ssh_mgr.is_connected and self.ssh_mgr.shell is shell:
+            self.sig_conn_lost.emit(reason)
+
+    def _feed_terminal_slot(self, text):
+        self.output.feed(text)
+        self._quiet_timer.start()
+
+    # ------------------------------------------------------------------ #
+    #  Integração com o shell (pasta, usuário e screen atuais)             #
+    # ------------------------------------------------------------------ #
+    def _reset_shell_tracking(self):
+        self._hook_token = secrets.token_hex(8)
+        self._hook_armed = False      # falta confirmar que este shell tem o hook
+        self._hook_initial = False    # shell de login: aceita prompt sem $/#
+        self._hook_active = False     # já chegou relatório nesta conexão
+        self._hook_fails = 0          # envios seguidos sem resposta
+        self._shell_user = ""
+        self._shell_cwd = ""
+        self._shell_sty = ""
+        self._sync_dirty = False
+        self._sftp_refused_user = ""  # não insistir a cada prompt
+        self._denied_path = ""
+
+    def note_terminal_input(self, data):
+        """Chamado para tudo que o usuário envia ao shell (terminal ou caixa de
+        comando). Um Enter pode ter trocado de shell (su, screen -r, bash...)."""
+        self._quiet_timer.start()
+        if backend.is_sudo_prompt(self.output.cursor_line()):
+            self._capture_sudo_password(data)
+        else:
+            self._sudo_typed.clear()
+        if "\r" in data:
+            self._hook_armed = True
+            self._hook_initial = False
+
+    def _capture_sudo_password(self, data):
+        """Guarda a senha digitada no prompt do sudo: o SFTP precisa dela para
+        acompanhar a troca de usuário, sem pedir a mesma senha outra vez."""
+        for ch in data:
+            if ch in "\r\n":
+                self.sudo_cache[0] = "".join(self._sudo_typed)
+                self._sudo_typed.clear()
+            elif ch in "\x7f\x08":
+                del self._sudo_typed[-1:]
+            elif ch in "\x03\x15":
+                self._sudo_typed.clear()
+            elif ch >= " ":
+                self._sudo_typed.append(ch)
+
+    def _on_terminal_quiet(self):
+        """Terminal parado: mascara a caixa de comando em prompt de senha e, se
+        o Enter não resultou em relatório, instala o hook no shell atual."""
+        if not self.ssh_mgr.is_connected:
+            return
+        line = self.output.cursor_line()
+        masked = backend.is_password_prompt(line)
+        self.cmd_input.setEchoMode(QLineEdit.EchoMode.Password if masked
+                                   else QLineEdit.EchoMode.Normal)
+        if not self._hook_armed or self._hook_fails >= 3:
+            return
+        if backend.is_shell_prompt(line) or (
+                self._hook_initial and backend.is_initial_prompt(line)):
+            self._inject_shell_hook(len(line))
+
+    def _inject_shell_hook(self, prompt_len):
+        cols = max(1, self.output.term_size()[0])
+        length = len(backend.build_shell_hook(self._hook_token, 1))
+        rows = (prompt_len + length) // cols + 1
+        self._hook_armed = False
+        self._hook_fails += 1
+        self.output.hold_repaint(1000)
+        self.output.send_text(backend.build_shell_hook(self._hook_token, rows) + "\r",
+                              notify=False)
+
+    def _on_shell_report(self, report):
+        token, user, host, sty, path = report
+        if token != self._hook_token:
+            return  # forjado por algum texto exibido no terminal
+        self._hook_armed = False
+        self._hook_fails = 0
+        self.output.release_repaint()
+        if self._remote_uname and host != self._remote_uname:
+            return  # ssh aninhado ou contêiner: não é o disco que o Explorer vê
+        self._hook_active = True
+        if sty != self._shell_sty:
+            self._shell_sty = sty
+            self.set_screen_status(bool(sty), sty.split(".", 1)[-1])
+        self._shell_user, self._shell_cwd = user, path
+        with self._sync_lock:
+            self._sync_dirty = True
+            if self._sync_busy:
+                return
+            self._sync_busy = True
+        threading.Thread(target=self._shell_sync_worker, daemon=True).start()
+
+    def _shell_sync_worker(self):
+        """Leva o Explorer ao estado informado pelo shell. Fica fora da GUI
+        porque o SFTP e o sudo podem demorar."""
+        while True:
+            with self._sync_lock:
+                if not self._sync_dirty or not self.ssh_mgr.is_connected:
+                    self._sync_busy = False
+                    return
+                self._sync_dirty = False
+            user, path = self._shell_user, self._shell_cwd
+            try:
+                user_changed = self._follow_shell_user(user)
+                if self._follow_shell_path(path, user_changed) or user_changed:
+                    self.sig_explorer.emit()
+            except Exception as e:
+                self.sig_log.emit(f"[Nix] Explorer: {e}")
+
+    def _follow_shell_user(self, user):
+        mgr = self.ssh_mgr
+        if user == mgr.sftp_user:
+            # Saiu do usuário recusado: uma nova tentativa pode dar certo
+            self._sftp_refused_user = ""
+            return False
+        if not user or self.active_transfers:
+            return False
+        if user == mgr.username:
+            mgr.reset_sftp_user()
+            self._sftp_refused_user = ""
+            self.sig_log.emit(f"[Nix] SFTP reverted to: {user}")
+            return True
+        if user == self._sftp_refused_user:
+            return False
+        try:
+            try:
+                mgr.switch_sftp_user(user, self.sudo_cache[0])
+            except SudoPasswordRequired:
+                password = self._get_sudo_pwd() if self._has_sudo else None
+                if not password:
+                    raise
+                self.sudo_cache[0] = password
+                mgr.switch_sftp_user(user, password)
+        except SudoPasswordRequired:
+            self._sftp_refused_user = user
+            self.sig_log.emit(f"[Nix] Explorer stays as {mgr.sftp_user}: "
+                              f"sudo access is needed to open it as {user}")
+            return False
+        except SudoAuthError:
+            self.sudo_cache[0] = None
+            self._sftp_refused_user = user
+            self.sig_log.emit(f"[Nix] Explorer stays as {mgr.sftp_user}: "
+                              f"sudo refused access as {user}")
+            return False
+        except Exception as e:
+            self._sftp_refused_user = user
+            self.sig_log.emit(f"[Nix] Failed to elevate SFTP: {e}")
+            return False
+        self._sftp_refused_user = ""
+        self.sig_log.emit(f"[Nix] SFTP elevated as: {user}")
+        return True
+
+    def _follow_shell_path(self, path, force):
+        if not path or (path == self.remote_path and not force):
+            return False
+        try:
+            with self.ssh_mgr.lock:
+                self.ssh_mgr.sftp.chdir(path)
+                # Mantém o $PWD lógico (getcwd resolveria symlinks e o caminho
+                # deixaria de bater com o próximo relatório)
+                self.remote_path = path
+            self._denied_path = ""
+            return True
+        except Exception:
+            if path != self._denied_path:
+                self._denied_path = path
+                self.sig_log.emit(f"[Nix] Explorer ({self.ssh_mgr.sftp_user}) "
+                                  f"cannot open: {path}")
+            return False
+
+    def _sync_pty_slot(self):
+        self.output.sync_pty_size()
+
+    def refresh_terminal_theme(self):
+        """Aplica tema/fonte do Nix (Standard/Retro/Matrix) ao terminal real.
+
+        Retro e Matrix têm identidade própria (fundo escuro + fosforescente),
+        então usam cores fixas legíveis mesmo no modo claro. O Standard segue
+        o modo claro/escuro e a cor customizada ("Term Color").
+        """
+        thm = self.config_mgr.theme
+        mode = thm.get("mode", "dark")
+        style = thm.get("term_style", "standard")
+        default_dark_fg = "#a6accd"
+        custom_fg = thm.get("terminal_color", default_dark_fg)
+        light_palette = False
+        crt = False
+        if style == "matrix":
+            family, bold, bg = "Courier New", True, "#000000"
+            fg = "#00ff41"          # verde Matrix clássico
+        elif style == "retro":
+            family, bold, bg = "Courier", True, "#1a1a1a"
+            fg = "#ffb000"          # âmbar CRT
+        elif style == "crt":
+            # cool-retro-term: fósforo verde sobre tubo, com scanlines,
+            # glow e vinheta (efeitos desenhados pelo próprio widget)
+            family, bold, bg = "Courier New", True, "#0a1206"
+            fg = "#33ff33"
+            crt = True
+        elif style == "crt_blue":
+            # variação de fósforo azul (estilo monitores IBM antigos)
+            family, bold, bg = "Courier New", True, "#050d18"
+            fg = "#4dc4ff"
+            crt = True
+        else:
+            family, bold = "Consolas", False
+            if mode == "dark":
+                bg, fg = "#0d0a0d", custom_fg
+            else:
+                bg = "#f5f5f5"
+                fg = "#2d3436" if custom_fg == default_dark_fg else custom_fg
+                light_palette = True   # paleta ANSI escurecida p/ fundo claro
+        size = (self.parent_ui.terminal_font_size if self.parent_ui
+                else thm.get("font_size", 13))
+        self.output.set_terminal_style(family, size, bold, fg, bg,
+                                       light_palette=light_palette, crt=crt)
 
     def monitor_loop(self):
         self.last_rx = self.last_tx = 0
         self.last_time = time.time()
-        while self.ssh_mgr.is_connected:
+        conn = self.ssh_mgr.client   # identifica ESTA conexão (evita loops duplicados após reconectar)
+        alive = lambda: self.ssh_mgr.is_connected and self.ssh_mgr.client is conn
+        fail_backoff = 0  # backoff exponencial em falhas consecutivas
+        while alive():
+            # Painel escondido (outra aba, janela minimizada/na bandeja ou outra
+            # sub-aba): não gasta rede/CPU do servidor. Ao voltar, zera a base
+            # do cálculo de tráfego para não mostrar uma média enorme.
+            if not self._monitor_visible:
+                self.last_rx = self.last_tx = 0
+                time.sleep(0.5)
+                continue
             try:
                 cmd = ("grep 'cpu ' /proc/stat; sleep 1; grep 'cpu ' /proc/stat; "
                        "echo '==MEM=='; cat /proc/meminfo; echo '==NET=='; cat /proc/net/dev; "
                        "echo '==USERS=='; who; echo '==PROCS=='; "
                        "ps -eo pid,user,pcpu,pmem,comm --sort=-pcpu --no-headers | head -n 15")
-                _, stdout, _ = self.ssh_mgr.execute(cmd)
+                # timeout generoso: o comando leva ~1-2s (tem sleep 1); 20s só
+                # dispara se o canal travar de vez, evitando vazar sessão.
+                _, stdout, _ = self.ssh_mgr.execute(cmd, timeout=20)
                 parsed = backend.parse_monitor_output(stdout.read().decode().strip())
                 if len(parsed) == 3:
                     self.sig_monitor.emit(parsed[0], parsed[1], parsed[2], {}, [], {})
                 else:
                     self.sig_monitor.emit(*parsed)
-                time.sleep(2)
+                fail_backoff = 0  # sucesso: volta ao ritmo normal
+                # Ritmo dividido em fatias de 0.5s para reagir rápido ao
+                # disconnect sem manter o loop ocioso preso num sleep longo.
+                for _ in range(4):
+                    if not alive():
+                        return
+                    time.sleep(0.5)
             except Exception:
-                time.sleep(4)
+                # Servidor sob carga / conexão instável: recua até 30s para não
+                # martelar o servidor com reconexões e novos canais.
+                fail_backoff = min(fail_backoff + 1, 6)
+                for _ in range(2 ** fail_backoff):
+                    if not alive():
+                        return
+                    time.sleep(0.5)
 
     def fetch_os_thread(self):
         info = backend.fetch_os_info(self.ssh_mgr)
         self.sig_os_info.emit(info)
 
     def log_local_slot(self, message):
-        if self.auto_scroll:
-            self.output.appendPlainText(f"\n> {message}")
-        else:
-            sb = self.output.verticalScrollBar()
-            pos = sb.value()
-            self.output.appendPlainText(f"\n> {message}")
-            sb.setValue(pos)
+        self.output.append_local(message)
 
     def show_msg_slot(self, msg_type, title, text):
         if msg_type == "error":    QMessageBox.critical(self, title, text)
@@ -941,6 +1502,19 @@ class ConnectionTab(QWidget):
         text, ok = QInputDialog.getText(self, "Sudo", t("enter_sudo", self.config_mgr.language),
                                         QLineEdit.EchoMode.Password)
         if ok: result_list[0] = text
+        event.set()
+
+    def ask_hostkey_slot(self, hostname, keytype, fingerprint, result_list, event):
+        """Pergunta ao usuário se confia numa host key desconhecida (1ª conexão)."""
+        lang = self.config_mgr.language
+        reply = QMessageBox.question(
+            self, t("hostkey_title", lang),
+            f"{t('hostkey_unknown', lang)}\n\n"
+            f"Host: {hostname}\n{keytype} {fingerprint}\n\n"
+            f"{t('hostkey_confirm', lang)}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        result_list[0] = (reply == QMessageBox.StandardButton.Yes)
         event.set()
 
     def set_screen_status(self, in_screen, name=""):
@@ -958,15 +1532,34 @@ class ConnectionTab(QWidget):
     def update_screens_ui_slot(self, win, output):
         if hasattr(win, 'update_ui'): win.update_ui(output)
 
+    @staticmethod
+    def _fmt_eta(seconds):
+        seconds = int(max(0, seconds))
+        h, rem = divmod(seconds, 3600)
+        m, sec = divmod(rem, 60)
+        return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
+
     def update_progress_slot(self, transferred, total, transfer_id):
         entry = self.active_transfers.get(transfer_id)
-        if entry:
-            pbar = entry['pbar']
-            try:
-                if total > 0:
-                    pbar.setValue(int((transferred / total) * 100))
-            except RuntimeError:
-                pass
+        if not entry or entry.get('state') != 'running':
+            return
+        try:
+            if total > 0:
+                entry['pbar'].setValue(int((transferred / total) * 100))
+            now = time.time()
+            last_t, last_b = entry['sample']
+            dt = now - last_t
+            if dt >= 0.5:
+                inst = max(0, transferred - last_b) / dt
+                speed = inst if entry['speed'] == 0 else 0.6 * entry['speed'] + 0.4 * inst
+                entry['speed'] = speed
+                entry['sample'] = (now, transferred)
+                text = f"{self.format_file_size(speed)}/s"
+                if speed > 0 and total > transferred:
+                    text += f" \u00b7 {self._fmt_eta((total - transferred) / speed)}"
+                entry['info'].setText(text)
+        except RuntimeError:
+            pass
 
     def update_monitor_ui_slot(self, cpu, ram, procs, net_bytes, users, mem_info):
         try:
@@ -1014,6 +1607,7 @@ class ConnectionTab(QWidget):
 
     def toggle_auto_scroll(self, checked):
         self.auto_scroll = checked
+        self.output.auto_scroll = checked
         lang = self.config_mgr.language
         if checked:
             self.btn_auto_scroll.setToolTip(t("tip_scroll_on", lang))
@@ -1048,30 +1642,76 @@ class ConnectionTab(QWidget):
         return super().eventFilter(obj, event)
 
     def autocomplete_terminal(self):
-        if not self.ssh_mgr.is_connected or not self.ssh_mgr.sftp: return
-        cmd = self.cmd_input.text()
-        if not cmd: return
-        parts = cmd.split(); last_word = parts[-1]
-        try:
-            if '/' in last_word:
-                dir_path = posixpath.dirname(last_word) or "/"
-                prefix   = posixpath.basename(last_word)
-                if not dir_path.startswith('/'): dir_path = posixpath.join(self.remote_path, dir_path)
-                with self.ssh_mgr.lock: items = self.ssh_mgr.sftp.listdir(dir_path)
-            else:
-                prefix = last_word
-                with self.ssh_mgr.lock: items = self.ssh_mgr.sftp.listdir(self.remote_path)
-            matches = [m for m in items if m.startswith(prefix)]
-            if not matches: return
-            common = os.path.commonprefix(matches)
-            if common and common != prefix:
-                new_word = common
-                if '/' in last_word: new_word = posixpath.join(posixpath.dirname(last_word), new_word)
-                self.cmd_input.setText(cmd[:len(cmd) - len(last_word)] + new_word)
-            elif len(matches) > 1:
-                self.sig_log.emit(f"Options: {'   '.join(matches)}")
-        except Exception:
-            pass
+        """Tab estilo bash: completa a palavra sob o cursor (não só a última),
+        funcionando com texto depois do cursor, aspas, espaços escapados, ~ e
+        comandos (1ª palavra / depois de | ; && sudo). Usa o `compgen` do bash
+        no servidor, então respeita o diretório atual e os comandos do PATH."""
+        if not self.ssh_mgr.is_connected:
+            return
+        text = self.cmd_input.text()
+        cursor = self.cmd_input.cursorPosition()
+        ctx = backend.split_completion_context(text[:cursor])
+        value = ctx["value"]
+        cmd_mode = ctx["cmd_pos"] and "/" not in value and not value.startswith("~")
+        if cmd_mode and not value:
+            return   # completar TODOS os comandos do PATH não ajuda
+        home = self._home_path or self.remote_path
+        query = (home + value[1:]) if value.startswith("~") else value
+        script = backend.build_completion_script(self.remote_path, query, cmd_mode)
+
+        def work():
+            matches = []
+            try:
+                _, stdout, _ = self.ssh_mgr.execute(script, timeout=8)
+                out = stdout.read().decode("utf-8", errors="replace")
+                matches = [ln for ln in out.split("\n") if ln]
+            except Exception:
+                pass
+            self.sig_completion.emit({"text": text, "cursor": cursor, "ctx": ctx,
+                                      "matches": matches, "home": home})
+        threading.Thread(target=work, daemon=True).start()
+
+    def _apply_completion(self, info):
+        """Slot (GUI): insere o resultado do Tab se o usuário não mexeu na linha."""
+        if (self.cmd_input.text() != info["text"]
+                or self.cmd_input.cursorPosition() != info["cursor"]):
+            return
+        ctx, text, cursor = info["ctx"], info["text"], info["cursor"]
+        insert, options = backend.compute_completion(ctx, info["matches"], info["home"])
+        if insert is not None:
+            self._replace_word(text, ctx["start"], cursor, insert)
+        elif len(options) > 1:
+            self._show_completion_menu(text, ctx, cursor, options)
+
+    def _replace_word(self, text, start, cursor, insert):
+        self.cmd_input.setText(text[:start] + insert + text[cursor:])
+        self.cmd_input.setCursorPosition(start + len(insert))
+
+    def _show_completion_menu(self, text, ctx, cursor, options):
+        """Vários candidatos sem prefixo comum maior: lista clicável (setas + Enter)."""
+        lang = self.config_mgr.language
+        if len(options) > 40:
+            self.sig_log.emit(t("tab_matches", lang).format(n=len(options)) + ":  "
+                              + "   ".join(o.rstrip("/").split("/")[-1] + ("/" if o.endswith("/") else "")
+                                           for o in options[:200]))
+            return
+        menu = QMenu(self.cmd_input)
+        for opt in options:
+            label = opt.rstrip("/").split("/")[-1] + ("/" if opt.endswith("/") else "")
+            act = menu.addAction(label)
+            act.triggered.connect(
+                lambda _=False, o=opt: self._pick_completion(text, ctx, cursor, o))
+        pos = self.cmd_input.mapToGlobal(self.cmd_input.rect().topLeft())
+        pos.setY(pos.y() - menu.sizeHint().height())   # abre acima da linha de comando
+        menu.exec(pos)
+        self.cmd_input.setFocus()
+
+    def _pick_completion(self, text, ctx, cursor, option):
+        if self.cmd_input.text() != text:
+            return
+        insert, _ = backend.compute_completion(ctx, [option], self._home_path or self.remote_path)
+        if insert is not None:
+            self._replace_word(text, ctx["start"], cursor, insert)
 
     def command_history_up(self):
         if self.command_history and self.history_index < len(self.command_history) - 1:
@@ -1088,24 +1728,19 @@ class ConnectionTab(QWidget):
                 self.cmd_input.clear()
 
     def send_command(self):
-        cmd = self.cmd_input.text().strip()
+        raw = self.cmd_input.text()
+        # O shell está pedindo uma senha: a resposta vai sem alteração (senha
+        # pode ter espaços) e nunca para o histórico, que é salvo em disco.
+        if backend.is_password_prompt(self.output.cursor_line()):
+            self.cmd_input.clear()
+            self.output.send_text(raw + "\r")
+            return
+
+        cmd = raw.strip()
         if not cmd: return
 
-        if cmd.startswith(("sudo su ", "su ", "sudo -i", "sudo -s")) or cmd in ("sudo su", "su"):
-            parts = cmd.split()
-            target_user = "root"
-            for p in reversed(parts):
-                if p not in ["sudo", "su", "-", "-i", "-s"]: target_user = p; break
-            if not self.sudo_cache[0] and "sudo" in cmd:
-                lang = self.config_mgr.language
-                pwd, ok = QInputDialog.getText(self, "Sudo", t("enter_sudo", lang), QLineEdit.EchoMode.Password)
-                if ok: self.sudo_cache[0] = pwd
-            threading.Thread(target=self._async_switch_sftp_user, args=(target_user,), daemon=True).start()
-        elif cmd in ("exit", "logout"):
-            if self.ssh_mgr.sftp_user_stack:
-                threading.Thread(target=self._async_pop_sftp_user, daemon=True).start()
-            else:
-                self.set_screen_status(False)
+        if cmd in ("exit", "logout") and not self._hook_active:
+            self.set_screen_status(False)
 
         if cmd.startswith(("screen -S", "screen -r", "screen -x")):
             parts = cmd.split()
@@ -1125,10 +1760,12 @@ class ConnectionTab(QWidget):
 
         if cmd == "clear":
             self.clear_terminal()
-            if self.ssh_mgr.shell: self.ssh_mgr.shell.send("clear\r")
+            self.output.send_text("clear\r")
             self.cmd_input.clear(); return
 
-        if cmd.startswith("cd "):
+        # Com o hook ativo o próprio shell informa a pasta nova; este bloco só
+        # atende shells sem suporte ao hook.
+        if cmd.startswith("cd ") and not self._hook_active:
             target = cmd[3:].strip()
             try:
                 if target == "..":    self.navigate_back(); self.cmd_input.clear(); return
@@ -1145,7 +1782,7 @@ class ConnectionTab(QWidget):
             except Exception as e:
                 self.sig_log.emit(f"cd error: {str(e)}")
 
-        if self.ssh_mgr.shell: self.ssh_mgr.shell.send(cmd + "\r")
+        self.output.send_text(cmd + "\r")
         self.cmd_input.clear()
 
     def _save_command_history(self):
@@ -1174,29 +1811,6 @@ class ConnectionTab(QWidget):
         pwd = [None]; event = threading.Event()
         self.sig_ask_sudo.emit(pwd, event); event.wait(); return pwd[0]
 
-    def _async_switch_sftp_user(self, target_user):
-        try:
-            self.ssh_mgr.switch_sftp_user(target_user, self.sudo_cache[0])
-            self.sig_log.emit(f"[Nix] SFTP elevated as: {target_user}")
-            try:
-                with self.ssh_mgr.lock:
-                    self.ssh_mgr.sftp.chdir(f"/home/{target_user}" if target_user != "root" else "/root")
-                    self.remote_path = self.ssh_mgr.sftp.getcwd()
-            except Exception:
-                pass
-            self.sig_explorer.emit()
-        except Exception as e:
-            self.sig_log.emit(f"[Nix] Failed to elevate SFTP: {str(e)}")
-
-    def _async_pop_sftp_user(self):
-        try:
-            self.ssh_mgr.pop_sftp_user(self.sudo_cache[0])
-            current = self.ssh_mgr.sftp_user_stack[-1] if self.ssh_mgr.sftp_user_stack else "default"
-            self.sig_log.emit(f"[Nix] SFTP reverted to: {current}")
-            self.sig_explorer.emit()
-        except Exception:
-            pass
-
     def update_path_label(self):
         path = self.remote_path
         self.current_path.setText(("..." + path[-37:]) if len(path) > 40 else path)
@@ -1208,6 +1822,11 @@ class ConnectionTab(QWidget):
         self.sig_log.emit(f"[{t('path_copied', self.config_mgr.language)}: {self.remote_path}]")
 
     def go_home(self):
+        if self._hook_active and self.ssh_mgr.is_connected:
+            # O shell sabe qual é a home do usuário atual (pode ser outro após
+            # um su) e o relatório do próximo prompt atualiza o Explorer.
+            self.output.send_text("cd\r")
+            return
         self.remote_path = "/home"
         if self.ssh_mgr.is_connected:
             try:
@@ -1216,7 +1835,7 @@ class ConnectionTab(QWidget):
                 if real: self.remote_path = real
             except Exception:
                 pass
-            if self.ssh_mgr.shell: self.ssh_mgr.shell.send(f'cd "{self.remote_path}"\r')
+            if self.ssh_mgr.shell: self.ssh_mgr.shell.send(f'cd {backend.sh_quote(self.remote_path)}\r')
         self.sig_explorer.emit()
 
     def navigate_back(self):
@@ -1227,7 +1846,7 @@ class ConnectionTab(QWidget):
                 with self.ssh_mgr.lock:
                     self.ssh_mgr.sftp.chdir(parent)
                     self.remote_path = parent or "/"
-                if self.ssh_mgr.shell: self.ssh_mgr.shell.send(f'cd "{self.remote_path}"\r')
+                if self.ssh_mgr.shell: self.ssh_mgr.shell.send(f'cd {backend.sh_quote(self.remote_path)}\r')
                 self.sig_explorer.emit()
             except Exception as e:
                 self.sig_msg.emit("error", t("error", self.config_mgr.language), str(e))
@@ -1249,6 +1868,8 @@ class ConnectionTab(QWidget):
                     size   = "-" if is_dir else self.format_file_size(f.st_size)
                     item   = QTreeWidgetItem([f.filename, size, ftype, stat.filemode(f.st_mode), ""])
                     item.setIcon(0, self.get_file_icon(f.filename, is_dir=is_dir))
+                    # Tipo REAL guardado no item: não depende do texto traduzido
+                    item.setData(0, Qt.ItemDataRole.UserRole, "Directory" if is_dir else "File")
                     self.explorer.addTopLevelItem(item)
                 except Exception:
                     pass
@@ -1266,9 +1887,19 @@ class ConnectionTab(QWidget):
             item = self.explorer.topLevelItem(i)
             item.setHidden(s not in item.text(0).lower())
 
+    def _item_kind(self, item):
+        """"Directory" ou "File" — lido do dado guardado no item; só se faltar
+        (item antigo) cai para o texto da coluna, em qualquer idioma."""
+        kind = item.data(0, Qt.ItemDataRole.UserRole)
+        if kind in ("Directory", "File"):
+            return kind
+        text = item.text(2)
+        dir_names = {"Directory"} | {t("directory", l) for l in ("en", "pt", "es")}
+        return "Directory" if text in dir_names else "File"
+
     def get_item_info(self, item):
         filename  = item.text(0).strip()
-        item_type = item.text(2)
+        item_type = self._item_kind(item)
         new_path  = f"/{filename}" if self.remote_path == "/" else posixpath.join(self.remote_path, filename)
         return filename, new_path, item_type
 
@@ -1282,7 +1913,7 @@ class ConnectionTab(QWidget):
                     with self.ssh_mgr.lock:
                         self.ssh_mgr.sftp.chdir(new_path)
                         self.remote_path = new_path
-                    if self.ssh_mgr.shell: self.ssh_mgr.shell.send(f'cd "{self.remote_path}"\r')
+                    if self.ssh_mgr.shell: self.ssh_mgr.shell.send(f'cd {backend.sh_quote(self.remote_path)}\r')
                     self.sig_explorer.emit()
                 except Exception as e:
                     self.sig_msg.emit("error", t("error", self.config_mgr.language), f"Access denied: {str(e)}")
@@ -1495,6 +2126,28 @@ class ConnectionTab(QWidget):
                     self.sig_msg.emit("error", t("error", lang), str(e))
             self.sig_explorer.emit()
 
+    def _run_fs_cmd_and_refresh(self, cmd):
+        """Roda um comando de sistema de arquivos (rm/tar/unzip...) numa thread
+        e SÓ atualiza o explorer quando ele realmente termina.
+
+        Antes, o comando era disparado e esquecido ('fire-and-forget'): ao
+        soltar a referência do canal o paramiko podia fechá-lo no meio de uma
+        operação longa, truncando um tar/rm de pasta grande. Aqui lemos a saída
+        até o EOF (o que espera o comando acabar e drena a janela do canal, sem
+        deadlock) antes de sinalizar o refresh."""
+        lang = self.config_mgr.language
+        def run():
+            try:
+                _, out, err = self.ssh_mgr.execute(cmd)
+                out.read()  # lê até EOF: espera o comando terminar de fato
+                err_txt = err.read().decode('utf-8', errors='replace').strip()
+                if err_txt:
+                    self.sig_msg.emit("error", t("error", lang), err_txt)
+            except Exception as e:
+                self.sig_msg.emit("error", t("error", lang), str(e))
+            self.sig_explorer.emit()
+        threading.Thread(target=run, daemon=True).start()
+
     def ctx_delete(self, _):
         lang = self.config_mgr.language
         items = self.explorer.selectedItems()
@@ -1506,7 +2159,8 @@ class ConnectionTab(QWidget):
                 filename, new_path, item_type = self.get_item_info(item)
                 try:
                     if item_type in ("Directory", t("directory", lang)):
-                        self.ssh_mgr.execute(f'rm -rf "{new_path.replace(chr(34), chr(92)+chr(34))}"')
+                        # dir: rm -rf pode demorar; roda em thread e espera terminar
+                        self._run_fs_cmd_and_refresh(f'rm -rf {backend.sh_quote(new_path)}')
                     else:
                         with self.ssh_mgr.lock: self.ssh_mgr.sftp.remove(new_path)
                 except Exception as e:
@@ -1528,14 +2182,17 @@ class ConnectionTab(QWidget):
 
     def ctx_compress(self, path, filename):
         parent = posixpath.dirname(path)
-        self.ssh_mgr.execute(f'cd "{parent}" && tar -czf "{filename}.tar.gz" "{filename}"')
-        QTimer.singleShot(1500, self.sig_explorer.emit)
+        self._run_fs_cmd_and_refresh(
+            f'cd {backend.sh_quote(parent)} && '
+            f'tar -czf {backend.sh_quote(filename + ".tar.gz")} {backend.sh_quote(filename)}')
 
     def ctx_extract(self, path, filename):
         parent = posixpath.dirname(path)
-        cmd = f'cd "{parent}" && unzip -o "{path}"' if filename.endswith('.zip') else f'cd "{parent}" && tar -xzf "{path}"'
-        self.ssh_mgr.execute(cmd)
-        QTimer.singleShot(1500, self.sig_explorer.emit)
+        if filename.endswith('.zip'):
+            cmd = f'cd {backend.sh_quote(parent)} && unzip -o {backend.sh_quote(path)}'
+        else:
+            cmd = f'cd {backend.sh_quote(parent)} && tar -xzf {backend.sh_quote(path)}'
+        self._run_fs_cmd_and_refresh(cmd)
 
     def shortcut_rename(self):
         items = self.explorer.selectedItems()
@@ -1610,7 +2267,7 @@ class ConnectionTab(QWidget):
         """Executa o kill sem sudo numa thread para não travar a GUI."""
         lang = self.config_mgr.language
         try:
-            _, stdout, _ = self.ssh_mgr.execute(f"kill {sig} {pid}")
+            _, stdout, _ = self.ssh_mgr.execute(f"kill {backend.sh_quote(sig)} {backend.sh_quote(pid)}")
             stdout.channel.recv_exit_status()  # espera o comando terminar
             self.sig_log.emit(f"[kill {sig} {pid}]")
         except Exception as e:
@@ -1620,7 +2277,8 @@ class ConnectionTab(QWidget):
         """Executa o kill via sudo numa thread para não travar a GUI."""
         lang = self.config_mgr.language
         try:
-            stdin, _, stderr = self.ssh_mgr.execute(f"sudo -S kill {sig} {pid}")
+            stdin, _, stderr = self.ssh_mgr.execute(
+                f"sudo -S kill {backend.sh_quote(sig)} {backend.sh_quote(pid)}")
             stdin.write(self.sudo_cache[0] + "\n"); stdin.flush()
             err = stderr.read().decode().strip()
             if "incorrect" in err.lower() or "wrong password" in err.lower():
@@ -1668,8 +2326,8 @@ class ConnectionTab(QWidget):
             pwd, ok = QInputDialog.getText(self, "Sudo", t("enter_sudo", lang), QLineEdit.EchoMode.Password)
             if not ok: return
             self.sudo_cache[0] = pwd
-        cmd = (f"sudo -S pkill -9 -t {tty.replace('/dev/', '')}"
-               if tty else f"sudo -S pkill -9 -u {user}")
+        cmd = (f"sudo -S pkill -9 -t {backend.sh_quote(tty.replace('/dev/', ''))}"
+               if tty else f"sudo -S pkill -9 -u {backend.sh_quote(user)}")
         threading.Thread(target=self._kill_user_session_worker, args=(cmd, user), daemon=True).start()
 
     def _kill_user_session_worker(self, cmd, user):
@@ -1686,7 +2344,8 @@ class ConnectionTab(QWidget):
         except Exception as e:
             self.sig_log.emit(f"[erro ao desconectar {user}: {e}]")
 
-    def _add_transfer_row(self, tid, filename, direction):
+    def _add_transfer_row(self, tid, filename, direction, spec=None):
+        lang = self.config_mgr.language
         row = QWidget()
         rl = QHBoxLayout(row)
         rl.setContentsMargins(3, 2, 3, 2)
@@ -1697,24 +2356,52 @@ class ConnectionTab(QWidget):
         icon_name = 'fa5s.arrow-up' if direction == 'up' else 'fa5s.arrow-down'
         icon_lbl.setPixmap(qta.icon(icon_name, color=color).pixmap(14, 14))
 
-        disp = (filename[:28] + "…") if len(filename) > 28 else filename
+        disp = (filename[:28] + "\u2026") if len(filename) > 28 else filename
         lbl = QLabel(disp)
         lbl.setToolTip(filename)
+
+        info = QLabel("")
+        info.setMinimumWidth(96)
+        info.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
         pbar = QProgressBar()
         pbar.setFixedHeight(10)
         pbar.setRange(0, 100)
         pbar.setTextVisible(False)
-        pbar.setFixedWidth(110)
+        pbar.setFixedWidth(90)
+
+        btn_retry = QPushButton()
+        btn_retry.setIcon(qta.icon('fa5s.redo', color='white'))
+        btn_retry.setFixedSize(22, 22)
+        btn_retry.setToolTip(t("transfer_retry", lang))
+        btn_retry.hide()
+        btn_retry.clicked.connect(lambda _=False, i=tid: self._retry_transfer(i))
+
+        btn_cancel = QPushButton()
+        btn_cancel.setIcon(qta.icon('fa5s.times', color='white'))
+        btn_cancel.setFixedSize(22, 22)
+        btn_cancel.setToolTip(t("transfer_cancel", lang))
+        btn_cancel.clicked.connect(lambda _=False, i=tid: self._cancel_transfer(i))
 
         rl.addWidget(icon_lbl)
         rl.addWidget(lbl, 1)
+        rl.addWidget(info)
         rl.addWidget(pbar)
+        rl.addWidget(btn_retry)
+        rl.addWidget(btn_cancel)
+
+        old = self.active_transfers.get(tid)
+        if old:   # mesmo nome enviado de novo: troca a linha antiga
+            self._remove_transfer_row(tid)
 
         count = self._tp_list_layout.count()
         self._tp_list_layout.insertWidget(count - 1, row)
 
-        self.active_transfers[tid] = {'pbar': pbar, 'row': row}
+        self.active_transfers[tid] = {
+            'pbar': pbar, 'row': row, 'info': info, 'retry': btn_retry,
+            'cancel_btn': btn_cancel, 'cancel': False, 'state': 'running',
+            'spec': spec, 'sample': (time.time(), 0), 'speed': 0.0,
+        }
         self.transfer_panel.setVisible(True)
         self._update_transfer_header()
         return pbar
@@ -1731,11 +2418,64 @@ class ConnectionTab(QWidget):
         if not self.active_transfers:
             self.transfer_panel.setVisible(False)
 
+    def _cancel_transfer(self, tid):
+        """Botão X: cancela uma transferência em andamento; se já terminou
+        (falhou/cancelada) apenas remove a linha."""
+        entry = self.active_transfers.get(tid)
+        if not entry:
+            return
+        if entry['state'] == 'running':
+            entry['cancel'] = True          # a thread aborta no próximo callback
+            entry['cancel_btn'].setEnabled(False)
+        else:
+            self._remove_transfer_row(tid)
+
+    def _mark_transfer_failed(self, tid, state):
+        entry = self.active_transfers.get(tid)
+        if not entry:
+            return
+        lang = self.config_mgr.language
+        entry['state'] = state
+        entry['cancel_btn'].setEnabled(True)
+        entry['cancel_btn'].setToolTip(t("transfer_clear", lang))
+        entry['retry'].setVisible(entry.get('spec') is not None)
+        if state == 'cancelled':
+            entry['info'].setText(t("transfer_cancelled", lang))
+            entry['info'].setStyleSheet("color: #ffb000;")
+        else:
+            entry['info'].setText(t("transfer_failed", lang))
+            entry['info'].setStyleSheet("color: #dc3545;")
+        self._update_transfer_header()
+
+    def _retry_transfer(self, tid):
+        entry = self.active_transfers.get(tid)
+        if not entry or entry['state'] == 'running' or not entry.get('spec'):
+            return
+        if not self.ssh_mgr.is_connected:
+            return
+        spec = entry['spec']
+        entry.update(state='running', cancel=False, sample=(time.time(), 0), speed=0.0)
+        entry['pbar'].setValue(0)
+        entry['info'].setText("")
+        entry['info'].setStyleSheet("")
+        entry['retry'].hide()
+        entry['cancel_btn'].setToolTip(t("transfer_cancel", self.config_mgr.language))
+        self._update_transfer_header()
+        if spec['kind'] == 'up':
+            threading.Thread(target=self._upload_worker,
+                             args=([(spec['local'], spec['remote'], tid)],), daemon=True).start()
+        else:
+            threading.Thread(target=self._sequential_download_thread,
+                             args=([(spec['remote'], spec['local'], spec['is_dir'], tid)],),
+                             daemon=True).start()
+
     def _update_transfer_header(self):
-        n = len(self.active_transfers)
-        self.lbl_transfers.setText(f" Transfers ({n})")
+        n = sum(1 for e in self.active_transfers.values() if e['state'] == 'running')
+        self.lbl_transfers.setText(f" {t('transfers', self.config_mgr.language)} ({n})")
 
     def _force_hide_transfer_panel(self):
+        for tid in [i for i, e in self.active_transfers.items() if e['state'] != 'running']:
+            self._remove_transfer_row(tid)
         self.transfer_panel.setVisible(False)
 
     def refresh_transfer_panel_theme(self):
@@ -1750,46 +2490,71 @@ class ConnectionTab(QWidget):
             self._last_progress_time[transfer_id] = now
             self.sig_transfer_progress.emit(transferred, total, transfer_id)
 
+    def _transfer_cb(self, tid, done, total):
+        """Callback do SFTP (thread de transferência): aborta se o usuário
+        cancelou; senão repassa o progresso (com throttle)."""
+        entry = self.active_transfers.get(tid)
+        if entry and entry.get('cancel'):
+            raise backend.TransferCancelled()
+        self.sftp_progress_callback(done, total, tid)
+
     def create_upload_item(self, local_path):
         filename = os.path.basename(local_path)
         transfer_id = f"up_{filename}"
-        self._add_transfer_row(transfer_id, filename, "up")
+        remote = posixpath.join(self.remote_path, filename)
+        self._add_transfer_row(transfer_id, filename, "up",
+                               spec={'kind': 'up', 'local': local_path, 'remote': remote})
+        return transfer_id, remote
 
     def upload_file_dialog(self):
         if not self.ssh_mgr.is_connected: return
         files, _ = QFileDialog.getOpenFileNames(self, t("select_files", self.config_mgr.language))
-        if files:
-            for f in files: self.create_upload_item(f)
-            threading.Thread(target=self.upload_files_thread, args=(files,), daemon=True).start()
+        self._start_uploads(files)
 
     def upload_dir_dialog(self):
         if not self.ssh_mgr.is_connected: return
         d = QFileDialog.getExistingDirectory(self, t("select_folder", self.config_mgr.language))
-        if d:
-            self.create_upload_item(d)
-            threading.Thread(target=self.upload_files_thread, args=([d],), daemon=True).start()
+        self._start_uploads([d] if d else [])
 
     def on_drop_files(self, files):
         if not self.ssh_mgr.is_connected: return
-        if files:
-            for f in files: self.create_upload_item(f)
-            threading.Thread(target=self.upload_files_thread, args=(files,), daemon=True).start()
+        self._start_uploads(files)
 
-    def upload_files_thread(self, paths):
+    def _start_uploads(self, paths):
+        if not paths:
+            return
+        jobs = []
+        for f in paths:
+            tid, remote = self.create_upload_item(f)
+            jobs.append((f, remote, tid))
+        threading.Thread(target=self._upload_worker, args=(jobs,), daemon=True).start()
+
+    def _upload_worker(self, jobs):
         sudo_pwd = [None]
-        for local_path in paths:
-            filename    = os.path.basename(local_path)
-            remote_file = posixpath.join(self.remote_path, filename)
-            tid         = f"up_{filename}"
+        for local_path, remote_file, tid in jobs:
+            filename = os.path.basename(local_path)
+            state = "done"
             try:
-                cb = lambda t2, tot, tid=tid: self.sftp_progress_callback(t2, tot, tid)
-                backend.upload_recursive(self.ssh_mgr, local_path, remote_file, sudo_pwd, self._get_sudo_pwd, progress_cb=cb)
+                cb = lambda done, tot, tid=tid: self._transfer_cb(tid, done, tot)
+                backend.upload_recursive(self.ssh_mgr, local_path, remote_file, sudo_pwd,
+                                         self._get_sudo_pwd, progress_cb=cb)
                 self.sig_notify.emit(t("upload_done", self.config_mgr.language), filename)
+            except backend.TransferCancelled:
+                state = "cancelled"
+                if os.path.isfile(local_path):   # não deixa arquivo pela metade no servidor
+                    try:
+                        with self.ssh_mgr.lock:
+                            self.ssh_mgr.sftp.remove(remote_file)
+                    except Exception:
+                        pass
             except Exception:
-                pass
-            finally:
+                state = "failed"
+            if state == "done":
                 self.sig_transfer_done.emit(tid)
-        QTimer.singleShot(500, self.sig_explorer.emit)
+            else:
+                self.sig_transfer_failed.emit(tid, state)
+        time.sleep(0.5)
+        self.sig_explorer.emit()
 
     def download_file_dialog(self):
         items = self.explorer.selectedItems()
@@ -1802,21 +2567,25 @@ class ConnectionTab(QWidget):
             filename, remote_path, item_type = self.get_item_info(item)
             is_dir = item_type in (t("directory", self.config_mgr.language), "Directory")
             tid = f"dl_{filename}_{id(item)}"
-            self._add_transfer_row(tid, filename, "down")
-            downloads.append((remote_path, os.path.join(local_dir, filename), is_dir, tid))
+            local_path = os.path.join(local_dir, filename)
+            self._add_transfer_row(tid, filename, "down",
+                                   spec={'kind': 'down', 'remote': remote_path,
+                                         'local': local_path, 'is_dir': is_dir})
+            downloads.append((remote_path, local_path, is_dir, tid))
 
         threading.Thread(target=self._sequential_download_thread, args=(downloads,), daemon=True).start()
 
     def _sequential_download_thread(self, downloads):
         for remote_path, local_path, is_dir, transfer_id in downloads:
             filename = os.path.basename(local_path)
+            state = "done"
             try:
                 if is_dir:
                     total_bytes = backend.count_remote_size(self.ssh_mgr, remote_path)
                     transferred_ref = [0]
 
                     def _cb(done, total, tid=transfer_id):
-                        self.sig_transfer_progress.emit(done, total, tid)
+                        self._transfer_cb(tid, done, total)
 
                     if total_bytes > 0:
                         backend.download_directory_with_progress(
@@ -1826,15 +2595,25 @@ class ConnectionTab(QWidget):
                         backend.download_directory_recursive(self.ssh_mgr, remote_path, local_path)
                 else:
                     def _cb_file(t2, tot, tid=transfer_id):
-                        self.sig_transfer_progress.emit(t2, tot, tid)
+                        self._transfer_cb(tid, t2, tot)
                     with self.ssh_mgr.lock:
                         self.ssh_mgr.sftp.get(remote_path, local_path, callback=_cb_file)
                 self.sig_notify.emit(t("download_done", self.config_mgr.language), filename)
+            except backend.TransferCancelled:
+                state = "cancelled"
+                if not is_dir and os.path.isfile(local_path):   # descarta o parcial
+                    try:
+                        os.remove(local_path)
+                    except OSError:
+                        pass
             except Exception:
-                pass
-            finally:
+                state = "failed"
+            if state == "done":
                 self.sig_transfer_done.emit(transfer_id)
-        QTimer.singleShot(500, self.sig_explorer.emit)
+            else:
+                self.sig_transfer_failed.emit(transfer_id, state)
+        time.sleep(0.5)
+        self.sig_explorer.emit()
 
     def handle_drag_out(self, item):
         items = self.explorer.selectedItems()
@@ -1860,8 +2639,7 @@ class ConnectionTab(QWidget):
     def _handle_remote_move(self, source_items, target_item):
         if not self.ssh_mgr.is_connected: return
         lang = self.config_mgr.language
-        target_type = target_item.text(2)
-        if target_type not in (t("directory", lang), "Directory"): return
+        if self._item_kind(target_item) != "Directory": return
         target_name = target_item.text(0)
         target_path = posixpath.join(self.remote_path, target_name)
         sources = []
@@ -1875,13 +2653,14 @@ class ConnectionTab(QWidget):
     def _execute_remote_move(self, source_paths, target_dir):
         try:
             for src in source_paths:
-                _, _, err = self.ssh_mgr.execute(f'mv -f "{src}" "{target_dir}/"')
+                _, _, err = self.ssh_mgr.execute(
+                    f'mv -f {backend.sh_quote(src)} {backend.sh_quote(target_dir + "/")}')
                 err_txt = err.read().decode().strip()
                 if err_txt:
-                    QTimer.singleShot(0, lambda e=err_txt: self.sig_msg.emit("error", "Move", e))
-            QTimer.singleShot(500, self.sig_explorer.emit)
+                    gui_single_shot(0, lambda e=err_txt: self.sig_msg.emit("error", "Move", e))
+            gui_single_shot(500, self.sig_explorer.emit)
         except Exception as e:
-            QTimer.singleShot(0, lambda: self.sig_msg.emit("error", "Move", str(e)))
+            gui_single_shot(0, lambda: self.sig_msg.emit("error", "Move", str(e)))
 
     def load_snippets_ui(self):
         self.list_snippets.clear()
@@ -1928,7 +2707,7 @@ class ConnectionTab(QWidget):
             cmd = self._expand_snippet_vars(cmd)
             if cmd is None:
                 return
-            self.ssh_mgr.shell.send(cmd + "\r")
+            self.output.send_text(cmd + "\r")
             self.sig_log.emit(f"[Snippet: {cmd}]")
 
     def show_screens_manager(self):

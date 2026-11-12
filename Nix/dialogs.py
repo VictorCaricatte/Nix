@@ -13,8 +13,10 @@ from PyQt6.QtGui import (
 import posixpath
 import threading
 import os
+import time
 import csv
 import io
+from backend import sh_quote
 
 try:
     from pygments import highlight
@@ -31,6 +33,7 @@ except ImportError:
     HAS_PANDAS = False
 
 from i18n import t, TRANSLATIONS
+from widgets import gui_single_shot
 
 class LineNumberArea(QWidget):
     def __init__(self, editor):
@@ -219,8 +222,7 @@ class RemoteEditorDialog(QDialog):
         content = ""
         try:
             if self.use_sudo:
-                safe_path = self.full_path.replace('"', '\\"')
-                stdin, stdout, stderr = self.parent_ui.ssh_mgr.execute(f'sudo -S cat "{safe_path}"')
+                stdin, stdout, stderr = self.parent_ui.ssh_mgr.execute(f'sudo -S cat {sh_quote(self.full_path)}')
                 stdout.channel.settimeout(5.0)
                 stderr.channel.settimeout(5.0)
                 
@@ -244,7 +246,7 @@ class RemoteEditorDialog(QDialog):
                 
                 if "incorrect password" in err_out or "senha incorreta" in err_out or "try again" in err_out or "tente novamente" in err_out:
                     QMessageBox.critical(self, t("error", self.lang), f"{t('incorrect_pass', self.lang)}\n{err_out.strip()}")
-                    QTimer.singleShot(0, self.reject)
+                    gui_single_shot(0, self.reject)
                     return
             else:
                 sftp = self.parent_ui.ssh_mgr.client.open_sftp()
@@ -259,14 +261,17 @@ class RemoteEditorDialog(QDialog):
         new_content = self.txt_editor.toPlainText()
         try:
             if self.use_sudo:
-                tmp_file = "$HOME/.nebula_nano_tmp.txt"
+                # Caminho absoluto em /tmp: o SFTP não expande $HOME (só o shell),
+                # então usar $HOME quebrava/era ambíguo. Nome único evita colisão.
+                tmp_file = f"/tmp/.nebula_nano_tmp_{os.getpid()}_{int(time.time())}.txt"
                 sftp = self.parent_ui.ssh_mgr.client.open_sftp()
                 with sftp.open(tmp_file, 'w') as f:
                     f.write(new_content)
                 sftp.close()
-                
-                safe_path = self.full_path.replace('"', '\\"')
-                cmd = f'sudo -S mv {tmp_file} "{safe_path}" && sudo -S chown root:root "{safe_path}"'
+
+                qp = sh_quote(self.full_path)
+                cmd = (f'sudo -S mv {sh_quote(tmp_file)} {qp} '
+                       f'&& sudo -S chown root:root {qp}')
                 
                 stdin, stdout, stderr = self.parent_ui.ssh_mgr.execute(cmd)
                 stdin.write(self.sudo_pwd + "\n")
@@ -492,21 +497,21 @@ class TableViewerDialog(QDialog):
                 QMessageBox.information(self, t("success", self.lang), t("saved", self.lang))
             except Exception as e:
                 if "Permission" in str(e) or "denied" in str(e).lower():
-                    tmp_file = "$HOME/.nebula_table_tmp"
+                    tmp_file = f"/tmp/.nebula_table_tmp_{os.getpid()}_{int(time.time())}"
                     with self.parent_ui.ssh_mgr.client.open_sftp() as sftp:
                         with sftp.open(tmp_file, mode) as f:
                             f.write(new_content)
-                            
-                    safe_path = self.file_path.replace('"', '\\"')
+
                     pwd = self.parent_ui.sudo_cache[0]
                     if not pwd:
                         pwd = self.parent_ui._get_sudo_pwd()
                         self.parent_ui.sudo_cache[0] = pwd
-                        
+
                     if not pwd:
                         raise Exception("SUDO cancelado")
-                        
-                    cmd = f'sudo -S mv {tmp_file} "{safe_path}" && sudo -S chown root:root "{safe_path}"'
+
+                    qp = sh_quote(self.file_path)
+                    cmd = f'sudo -S mv {sh_quote(tmp_file)} {qp} && sudo -S chown root:root {qp}'
                     stdin, stdout, stderr = self.parent_ui.ssh_mgr.execute(cmd)
                     stdin.write(pwd + "\n")
                     stdin.flush()
@@ -622,7 +627,15 @@ class ScreensManagerDialog(QDialog):
     def create_screen(self):
         name = self.input_new_screen.text().strip()
         if name:
-            self.parent_ui.ssh_mgr.execute(f"screen -dmS {name}")
+            # Cria a screen já dentro da pasta que está aberta na explorer.
+            # Sem o `cd`, o `screen -dmS` roda num canal SSH novo cujo diretório
+            # é sempre o home, então a screen nunca abria na pasta atual.
+            path = getattr(self.parent_ui, "remote_path", "") or ""
+            if path:
+                cmd = f"cd {sh_quote(path)} && screen -dmS {sh_quote(name)}"
+            else:
+                cmd = f"screen -dmS {sh_quote(name)}"
+            self.parent_ui.ssh_mgr.execute(cmd)
             self.input_new_screen.clear()
             self.refresh_screens()
 
@@ -688,7 +701,7 @@ class ScreensManagerDialog(QDialog):
         self.close()
 
     def detach_screen(self, name):
-        self.parent_ui.ssh_mgr.execute(f"screen -d {name}")
+        self.parent_ui.ssh_mgr.execute(f"screen -d {sh_quote(name)}")
         self.parent_ui.sig_log.emit(f"Detached {name}")
         self.parent_ui.sig_screen_status.emit(False, "")
         self.refresh_screens()
@@ -696,7 +709,7 @@ class ScreensManagerDialog(QDialog):
     def kill_screen(self, name):
         reply = QMessageBox.question(self, t("confirm", self.lang), f"{t('kill_screen', self.lang)} {name}?")
         if reply == QMessageBox.StandardButton.Yes:
-            self.parent_ui.ssh_mgr.execute(f"screen -S {name} -X quit")
+            self.parent_ui.ssh_mgr.execute(f"screen -S {sh_quote(name)} -X quit")
             self.parent_ui.sig_screen_status.emit(False, "")
             self.refresh_screens()
 
@@ -879,13 +892,9 @@ class AdvancedSearchDialog(QDialog):
             
         cmd = ""
         if content:
-
-            safe_content = content.replace("'", "'\\''")
-            cmd = f"grep -rn '{safe_content}' \"{search_dir}\" | head -n 100"
+            cmd = f"grep -rn -e {sh_quote(content)} {sh_quote(search_dir)} | head -n 100"
         else:
-
-            safe_name = name.replace("'", "'\\''")
-            cmd = f"find \"{search_dir}\" -type f -iname '*{safe_name}*' | head -n 100"
+            cmd = f"find {sh_quote(search_dir)} -type f -iname {sh_quote('*' + name + '*')} | head -n 100"
             
         self.results_tree.addTopLevelItem(QTreeWidgetItem(["Buscando...", cmd]))
         threading.Thread(target=self._do_search, args=(cmd,), daemon=True).start()
@@ -895,9 +904,9 @@ class AdvancedSearchDialog(QDialog):
             stdin, stdout, stderr = self.parent_ui.ssh_mgr.execute(cmd)
             out = stdout.read().decode('utf-8', errors='replace').strip()
             err = stderr.read().decode('utf-8', errors='replace').strip()
-            QTimer.singleShot(0, lambda: self._update_results(out, err))
+            gui_single_shot(0, lambda: self._update_results(out, err))
         except Exception as e:
-            QTimer.singleShot(0, lambda: self._update_results("", str(e)))
+            gui_single_shot(0, lambda: self._update_results("", str(e)))
             
     def _update_results(self, out, err):
         self.results_tree.clear()

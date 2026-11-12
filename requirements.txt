@@ -1,6 +1,14 @@
-PyQt6>=6.4.0
-paramiko>=3.5.0
-qtawesome>=1.4.2
-Pygments>=2.20.0
-pandas>=3.0.2
-openpyxl>=3.1.5
+# Nix — dependências (versões testadas em 2026-07)
+# Instale com:  pip install -r requirements.txt
+
+# --- Obrigatórias ---
+paramiko>=4.0.0        # cliente SSH/SFTP + túneis
+PyQt6>=6.10.2          # interface gráfica
+pyte>=0.8.2            # emulador de terminal VT (terminal real)
+QtAwesome>=1.4.2       # ícones da toolbar
+
+# --- Opcionais, mas recomendadas ---
+# Sem elas, o app funciona, mas as senhas salvas ficam em texto puro
+# (config.py degrada com try/except ImportError).
+cryptography>=46.0.4   # cifra as senhas salvas (Fernet)
+keyring>=25.7.0        # guarda a chave de cifra no cofre do SO
